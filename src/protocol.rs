@@ -3,8 +3,8 @@ use std::convert::{TryFrom, TryInto};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 
 use crate::{
-    ApsDataIndication, DestinationAddress, DeviceState, NetworkState, Parameter, ParameterId,
-    Platform, SequenceId, SourceAddress, Version,
+    ApsDataIndication, ApsDataRequest, Destination, DestinationAddress, DeviceState, NetworkState,
+    Parameter, ParameterId, Platform, SequenceId, SourceAddress, Version,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -49,6 +49,46 @@ impl DeviceState {
         }
     }
 }
+
+impl Destination {
+    fn payload_len(&self) -> u16 {
+        match self {
+            Destination::Group(_) => 2,
+            Destination::Nwk(_, _) => 3,
+            Destination::Ieee(_, _) => 9,
+        }
+    }
+
+    fn address_mode(&self) -> u8 {
+        match self {
+            Destination::Group(_) => 0x1,
+            Destination::Nwk(_, _) => 0x2,
+            Destination::Ieee(_, _) => 0x3,
+        }
+    }
+
+    fn write_address(&self, buf: &mut Vec<u8>) -> Result<()> {
+        match self {
+            Destination::Group(addr) | Destination::Nwk(addr, _) => {
+                buf.write_u16::<LittleEndian>(*addr)?
+            }
+            Destination::Ieee(addr, _) => buf.write_u64::<LittleEndian>(*addr)?,
+        }
+        Ok(())
+    }
+
+    fn write_endpoint(&self, buf: &mut Vec<u8>) -> Result<()> {
+        match self {
+            Destination::Group(_) => {}
+            Destination::Nwk(_, endpoint) | Destination::Ieee(_, endpoint) => {
+                buf.write_u8(*endpoint)?
+            }
+        }
+        Ok(())
+    }
+}
+
+pub type RequestId = u8;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CommandId {
@@ -113,23 +153,11 @@ impl TryFrom<u8> for CommandId {
 #[derive(Debug)]
 pub enum Request {
     Version,
-    ReadParameter {
-        parameter_id: ParameterId,
-    },
-    WriteParameter {
-        parameter: Parameter,
-    },
+    ReadParameter { parameter_id: ParameterId },
+    WriteParameter { parameter: Parameter },
     DeviceState,
     ApsDataIndication,
-    ApsDataRequest {
-        request_id: u8,
-        destination_address: DestinationAddress,
-        destination_endpoint: Option<u8>,
-        profile_id: u16,
-        cluster_id: u16,
-        source_endpoint: u8,
-        asdu: Vec<u8>,
-    },
+    ApsDataRequest(RequestId, ApsDataRequest),
 }
 
 impl Request {
@@ -140,7 +168,7 @@ impl Request {
             Request::WriteParameter { .. } => CommandId::WriteParameter,
             Request::DeviceState => CommandId::DeviceState,
             Request::ApsDataIndication => CommandId::ApsDataIndication,
-            Request::ApsDataRequest { .. } => CommandId::ApsDataRequest,
+            Request::ApsDataRequest(_, _) => CommandId::ApsDataRequest,
         }
     }
 
@@ -151,19 +179,12 @@ impl Request {
             Request::WriteParameter { parameter } => 1 + parameter.len(),
             Request::DeviceState => 0,
             Request::ApsDataIndication => 1,
-            Request::ApsDataRequest {
-                destination_address,
-                asdu,
-                ..
-            } => {
-                let base = 12;
-                let addr = match destination_address {
-                    DestinationAddress::Group(_) => 2, // short address
-                    DestinationAddress::Nwk(_) => 3,   // short address + endpoint
-                    DestinationAddress::Ieee(_) => 9,  // ieee address + endpoint
-                };
-                base + addr + (asdu.len() as u16)
-            }
+            Request::ApsDataRequest(
+                _,
+                ApsDataRequest {
+                    destination, asdu, ..
+                },
+            ) => 12 + destination.payload_len() + (asdu.len() as u16),
         }
     }
 
@@ -181,37 +202,21 @@ impl Request {
             Request::ApsDataIndication => {
                 buffer.write_u8(4)?;
             }
-            Request::ApsDataRequest {
+            Request::ApsDataRequest(
                 request_id,
-                destination_address,
-                destination_endpoint,
-                profile_id,
-                cluster_id,
-                source_endpoint,
-                asdu,
-            } => {
+                ApsDataRequest {
+                    destination,
+                    profile_id,
+                    cluster_id,
+                    source_endpoint,
+                    asdu,
+                },
+            ) => {
                 buffer.write_u8(request_id)?;
                 buffer.write_u8(0)?; // flags
-                match destination_address {
-                    DestinationAddress::Group(addr) => {
-                        buffer.write_u8(0x01)?; // addr type
-                        buffer.write_u16::<LittleEndian>(addr)?;
-                    }
-                    DestinationAddress::Nwk(addr) => {
-                        buffer.write_u8(0x02)?; // addr type
-                        buffer.write_u16::<LittleEndian>(addr)?;
-                        buffer.write_u8(destination_endpoint.ok_or(Error {
-                            kind: ErrorKind::Todo,
-                        })?)?;
-                    }
-                    DestinationAddress::Ieee(addr) => {
-                        buffer.write_u8(0x03)?; // addr type
-                        buffer.write_u64::<LittleEndian>(addr)?;
-                        buffer.write_u8(destination_endpoint.ok_or(Error {
-                            kind: ErrorKind::Todo,
-                        })?)?;
-                    }
-                }
+                buffer.write_u8(destination.address_mode())?;
+                destination.write_address(buffer)?;
+                destination.write_endpoint(buffer)?;
                 buffer.write_u16::<LittleEndian>(profile_id)?;
                 buffer.write_u16::<LittleEndian>(cluster_id)?;
                 buffer.write_u8(source_endpoint)?;
@@ -272,6 +277,19 @@ pub enum Response {
 }
 
 impl Response {
+    pub fn command_id(&self) -> CommandId {
+        match self {
+            Response::Version { .. } => CommandId::Version,
+            Response::Parameter(_) => CommandId::ReadParameter,
+            Response::WriteParameter(_) => CommandId::WriteParameter,
+            Response::DeviceState(_) => CommandId::DeviceState,
+            Response::DeviceStateChanged(_) => CommandId::DeviceStateChanged,
+            Response::ApsDataIndication(_) => CommandId::ApsDataIndication,
+            Response::ApsDataRequest { .. } => CommandId::ApsDataRequest,
+            Response::MacPoll { .. } => CommandId::MacPoll,
+        }
+    }
+
     pub fn from_frame(frame: Vec<u8>) -> Result<(SequenceId, Self)> {
         let command_id = frame[0].try_into()?;
         let sequence_id = frame[1];

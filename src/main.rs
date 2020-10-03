@@ -5,19 +5,23 @@ mod slip;
 mod types;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio_serial::{Serial, SerialPortSettings};
 
+use crate::protocol::RequestId;
+
 pub use crate::errors::{Error, ErrorKind, Result};
 pub use crate::parameters::{Parameter, ParameterId, PARAMETERS};
 pub use crate::protocol::{CommandId, Request, Response};
 pub use crate::slip::SlipError;
 pub use crate::types::{
-    ApsDataIndication, ClusterId, DestinationAddress, DeviceState, Endpoint, ExtendedAddress,
-    NetworkState, Platform, ProfileId, SequenceId, ShortAddress, SourceAddress, Version,
+    ApsDataIndication, ApsDataRequest, ClusterId, Destination, DestinationAddress, DeviceState,
+    Endpoint, ExtendedAddress, NetworkState, Platform, ProfileId, SequenceId, ShortAddress,
+    SourceAddress, Version,
 };
 
 const BAUD: u32 = 38400;
@@ -29,6 +33,7 @@ struct Command {
 
 struct Conbee {
     commands: mpsc::Sender<Command>,
+    request_id: AtomicU8,
 }
 
 impl Conbee {
@@ -41,6 +46,7 @@ impl Conbee {
         let writer = slip::Writer::new(writer);
 
         let (commands, commands_rx) = mpsc::channel(1);
+        let request_id = Default::default();
 
         let shared = Arc::new(Shared::default());
         let rx = Rx {
@@ -57,7 +63,10 @@ impl Conbee {
         tokio::spawn(rx.task());
         tokio::spawn(tx.task());
 
-        Self { commands }
+        Self {
+            commands,
+            request_id,
+        }
     }
 
     async fn make_request(&self, request: Request) -> Result<Response> {
@@ -72,6 +81,43 @@ impl Conbee {
         let response = receiver.await.map_err(|_| ErrorKind::ChannelError)?;
 
         Ok(response)
+    }
+
+    pub async fn version(&self) -> Result<(Version, Platform)> {
+        match self.make_request(Request::Version).await? {
+            Response::Version { version, platform } => Ok((version, platform)),
+            resp => Err(ErrorKind::UnexpectedResponse(resp.command_id()).into()),
+        }
+    }
+
+    pub async fn device_state(&self) -> Result<DeviceState> {
+        match self.make_request(Request::DeviceState).await? {
+            Response::DeviceState(device_state) => Ok(device_state),
+            resp => Err(ErrorKind::UnexpectedResponse(resp.command_id()).into()),
+        }
+    }
+
+    fn request_id(&self) -> u8 {
+        // Could this be Ordering::Relaxed?
+        self.request_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub async fn aps_data_request(&self, request: ApsDataRequest) -> Result<()> {
+        // TODO: check there are free slots.
+
+        let request_id = self.request_id();
+        let request = Request::ApsDataRequest(request_id, request);
+        let response = self.make_request(request).await?;
+
+        // We don't bother checking the request_id in the response, as the
+        // sequence_id should be sufficient.
+        if !matches!(response, Response::ApsDataRequest { .. }) {
+            return Err(ErrorKind::UnexpectedResponse(response.command_id()).into());
+        }
+
+        // TODO: Wait for confirm.
+
+        Ok(())
     }
 }
 
@@ -175,11 +221,19 @@ async fn main() -> Result<()> {
     let (reader, writer) = tokio::io::split(tty);
     let conbee = Conbee::new(reader, writer);
 
-    let fut1 = conbee.make_request(Request::Version);
-    let fut2 = conbee.make_request(Request::DeviceState);
+    let fut1 = conbee.version();
+    let fut2 = conbee.device_state();
+    let fut3 = conbee.aps_data_request(ApsDataRequest {
+        destination: Destination::Nwk(345, 0),
+        profile_id: 0,
+        cluster_id: 0x5,
+        source_endpoint: 0,
+        asdu: vec![0x0, 0x59, 0x1],
+    });
 
     dbg!(fut2.await?);
     dbg!(fut1.await?);
+    dbg!(fut3.await?);
 
     Ok(())
 }

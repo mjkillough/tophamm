@@ -1,8 +1,9 @@
-use crate::{ParameterId, SequenceId, SlipError};
+use crate::{CommandId, ParameterId, SequenceId, SlipError};
 
 #[derive(Debug)]
 pub enum ErrorKind {
     DuplicateSequenceId(SequenceId),
+    UnexpectedResponse(CommandId),
     UnsupportedCommand(u8),
     UnsupportedParameter(u8),
     InvalidParameter {

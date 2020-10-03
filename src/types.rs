@@ -59,3 +59,19 @@ pub struct ApsDataIndication {
     pub cluster_id: ClusterId,
     pub asdu: Vec<u8>,
 }
+
+#[derive(Debug)]
+pub enum Destination {
+    Group(ShortAddress),
+    Nwk(ShortAddress, Endpoint),
+    Ieee(ExtendedAddress, Endpoint),
+}
+
+#[derive(Debug)]
+pub struct ApsDataRequest {
+    pub destination: Destination,
+    pub profile_id: ProfileId,
+    pub cluster_id: ClusterId,
+    pub source_endpoint: Endpoint,
+    pub asdu: Vec<u8>,
+}
