@@ -4,15 +4,16 @@ mod protocol;
 mod slip;
 mod types;
 
-use byteorder::{ByteOrder, LittleEndian};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_serial::{Serial, SerialPortSettings};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use crate::slip::{Reader, Writer};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, oneshot};
+use tokio_serial::{Serial, SerialPortSettings};
 
 pub use crate::errors::{Error, ErrorKind, Result};
 pub use crate::parameters::{Parameter, ParameterId, PARAMETERS};
-pub use crate::protocol::{CommandId, Request, RequestKind, Response, ResponseKind};
+pub use crate::protocol::{CommandId, Request, Response};
 pub use crate::slip::SlipError;
 pub use crate::types::{
     ApsDataIndication, ClusterId, DestinationAddress, DeviceState, Endpoint, ExtendedAddress,
@@ -21,39 +22,139 @@ pub use crate::types::{
 
 const BAUD: u32 = 38400;
 
-struct Conbee<R, W>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    reader: Reader<R>,
-    writer: Writer<W>,
+struct Command {
+    request: Request,
+    sender: oneshot::Sender<Response>,
 }
 
-impl<R, W> Conbee<R, W>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    async fn make_request(&mut self, request: Request) -> Result<Response> {
-        println!("request = {:?}", request);
-        let frame = request.into_frame()?;
-        println!("sending = {:?}", frame);
-        self.writer.write_frame(&frame).await?;
+struct Conbee {
+    commands: mpsc::Sender<Command>,
+}
 
-        println!("waiting for resp");
+impl Conbee {
+    fn new<R, W>(reader: R, writer: W) -> Self
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let reader = slip::Reader::new(reader);
+        let writer = slip::Writer::new(writer);
 
-        let response = self.receive_response().await?;
+        let (commands, commands_rx) = mpsc::channel(1);
+
+        let shared = Arc::new(Shared::default());
+        let rx = Rx {
+            shared: shared.clone(),
+            reader,
+        };
+        let tx = Tx {
+            shared,
+            writer,
+            commands: commands_rx,
+            sequence_id: 0,
+        };
+
+        tokio::spawn(rx.task());
+        tokio::spawn(tx.task());
+
+        Self { commands }
+    }
+
+    async fn make_request(&self, request: Request) -> Result<Response> {
+        let (sender, receiver) = oneshot::channel();
+
+        self.commands
+            .clone()
+            .send(Command { request, sender })
+            .await
+            .map_err(|_| ErrorKind::ChannelError)?;
+
+        let response = receiver.await.map_err(|_| ErrorKind::ChannelError)?;
 
         Ok(response)
     }
+}
 
-    async fn receive_response(&mut self) -> Result<Response> {
-        let frame = self.reader.read_frame().await?;
-        println!("received = {:?}", frame);
-        let response = Response::from_frame(frame)?;
-        println!("response = {:?}", response);
-        Ok(response)
+#[derive(Default)]
+struct Shared {
+    awaiting: Mutex<HashMap<SequenceId, oneshot::Sender<Response>>>,
+}
+
+struct Rx<R>
+where
+    R: AsyncRead + Unpin,
+{
+    shared: Arc<Shared>,
+    reader: slip::Reader<R>,
+}
+
+impl<R> Rx<R>
+where
+    R: AsyncRead + Unpin,
+{
+    async fn task(mut self) -> Result<()> {
+        loop {
+            let frame = self.reader.read_frame().await?;
+            println!("received = {:?}", frame);
+
+            // TODO: Think about where to send errors
+            let (sequence_id, response) = Response::from_frame(frame)?;
+
+            if let Some(sender) = self.shared.awaiting.lock().unwrap().remove(&sequence_id) {
+                sender.send(response).map_err(|_| ErrorKind::ChannelError)?;
+            } else {
+                println!("don't know where to send frame");
+            }
+        }
+    }
+}
+
+struct Tx<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    shared: Arc<Shared>,
+    writer: slip::Writer<W>,
+    commands: mpsc::Receiver<Command>,
+    sequence_id: u8,
+}
+
+impl<W> Tx<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    async fn task(mut self) -> Result<()> {
+        while let Some(Command { request, sender }) = self.commands.recv().await {
+            // TODO: Propagate errors back through the oneshot.
+            let sequence_id = self.sequence_id();
+            let frame = request.into_frame(sequence_id)?;
+
+            self.register_awaiting(sequence_id, sender);
+
+            self.write_frame(frame).await?;
+        }
+
+        Ok(())
+    }
+
+    fn sequence_id(&mut self) -> SequenceId {
+        let old = self.sequence_id;
+        self.sequence_id += 1;
+        old
+    }
+
+    fn register_awaiting(&self, sequence_id: SequenceId, sender: oneshot::Sender<Response>) {
+        self.shared
+            .awaiting
+            .lock()
+            .unwrap()
+            .insert(sequence_id, sender);
+    }
+
+    async fn write_frame(&mut self, frame: Vec<u8>) -> Result<()> {
+        println!("sending = {:?}", frame);
+        self.writer.write_frame(&frame).await?;
+        Ok(())
     }
 }
 
@@ -72,94 +173,13 @@ async fn main() -> Result<()> {
     )?;
 
     let (reader, writer) = tokio::io::split(tty);
-    let reader = Reader::new(reader);
-    let writer = Writer::new(writer);
+    let conbee = Conbee::new(reader, writer);
 
-    let mut conbee = Conbee { reader, writer };
+    let fut1 = conbee.make_request(Request::Version);
+    let fut2 = conbee.make_request(Request::DeviceState);
 
-    let mut sequence_id = 1;
+    dbg!(fut2.await?);
+    dbg!(fut1.await?);
 
-    conbee
-        .make_request(Request {
-            sequence_id,
-            kind: RequestKind::Version,
-        })
-        .await?;
-    sequence_id += 1;
-
-    // conbee.make_request(Request {
-    //     sequence_id,
-    //     kind: RequestKind::DeviceState,
-    // })?;
-    // sequence_id += 1;
-
-    // conbee.make_request(Request {
-    //     sequence_id,
-    //     kind: RequestKind::WriteParameter {
-    //         parameter: Parameter::NetworkKey(0x01),
-    //     },
-    // })?;
-    // sequence_id += 1;
-
-    // conbee.make_request(Request {
-    //     sequence_id,
-    //     kind: RequestKind::ReadParameter {
-    //         parameter_id: ParameterId::NetworkKey,
-    //     },
-    // })?;
-    // sequence_id += 1;
-
-    let mut buf = [0; 3];
-    LittleEndian::write_u16(&mut buf[1..], 345);
-    conbee
-        .make_request(Request {
-            sequence_id,
-            kind: RequestKind::ApsDataRequest {
-                request_id: 1,
-                destination_address: DestinationAddress::Nwk(345),
-                destination_endpoint: Some(0),
-                profile_id: 0,
-                cluster_id: 5,
-                source_endpoint: 0,
-                asdu: buf.to_vec(),
-            },
-        })
-        .await?;
-    sequence_id += 1;
-
-    let mut response = conbee
-        .make_request(Request {
-            sequence_id,
-            kind: RequestKind::DeviceState,
-        })
-        .await?;
-    sequence_id += 1;
-    loop {
-        let data_indication = match response.kind {
-            ResponseKind::DeviceState(device_state)
-            | ResponseKind::DeviceStateChanged(device_state) => device_state.data_indication,
-            _ => false,
-        };
-
-        if dbg!(data_indication) {
-            conbee
-                .make_request(Request {
-                    sequence_id,
-                    kind: RequestKind::ApsDataIndication,
-                })
-                .await?;
-            sequence_id += 1;
-
-            response = conbee
-                .make_request(Request {
-                    sequence_id,
-                    kind: RequestKind::DeviceState,
-                })
-                .await?;
-            sequence_id += 1;
-        } else {
-            // Wait for unsolicited DeviceStateChanged
-            response = conbee.receive_response().await?;
-        }
-    }
+    Ok(())
 }

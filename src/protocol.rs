@@ -64,6 +64,17 @@ pub enum CommandId {
     MacPoll,
 }
 
+impl CommandId {
+    /// Whether a response of this kind was solicited by a request.
+    pub fn solicited(&self) -> bool {
+        match self {
+            CommandId::DeviceStateChanged => false,
+            CommandId::ApsDataIndication => false,
+            _ => true,
+        }
+    }
+}
+
 impl From<CommandId> for u8 {
     fn from(command_id: CommandId) -> u8 {
         match command_id {
@@ -100,7 +111,7 @@ impl TryFrom<u8> for CommandId {
 }
 
 #[derive(Debug)]
-pub enum RequestKind {
+pub enum Request {
     Version,
     ReadParameter {
         parameter_id: ParameterId,
@@ -121,26 +132,26 @@ pub enum RequestKind {
     },
 }
 
-impl RequestKind {
+impl Request {
     fn command_id(&self) -> CommandId {
         match self {
-            RequestKind::Version => CommandId::Version,
-            RequestKind::ReadParameter { .. } => CommandId::ReadParameter,
-            RequestKind::WriteParameter { .. } => CommandId::WriteParameter,
-            RequestKind::DeviceState => CommandId::DeviceState,
-            RequestKind::ApsDataIndication => CommandId::ApsDataIndication,
-            RequestKind::ApsDataRequest { .. } => CommandId::ApsDataRequest,
+            Request::Version => CommandId::Version,
+            Request::ReadParameter { .. } => CommandId::ReadParameter,
+            Request::WriteParameter { .. } => CommandId::WriteParameter,
+            Request::DeviceState => CommandId::DeviceState,
+            Request::ApsDataIndication => CommandId::ApsDataIndication,
+            Request::ApsDataRequest { .. } => CommandId::ApsDataRequest,
         }
     }
 
     fn payload_len(&self) -> u16 {
         match self {
-            RequestKind::Version => 0,
-            RequestKind::ReadParameter { .. } => 1,
-            RequestKind::WriteParameter { parameter } => 1 + parameter.len(),
-            RequestKind::DeviceState => 0,
-            RequestKind::ApsDataIndication => 1,
-            RequestKind::ApsDataRequest {
+            Request::Version => 0,
+            Request::ReadParameter { .. } => 1,
+            Request::WriteParameter { parameter } => 1 + parameter.len(),
+            Request::DeviceState => 0,
+            Request::ApsDataIndication => 1,
+            Request::ApsDataRequest {
                 destination_address,
                 asdu,
                 ..
@@ -158,19 +169,19 @@ impl RequestKind {
 
     fn write_payload(self, buffer: &mut Vec<u8>) -> Result<()> {
         match self {
-            RequestKind::Version => {}
-            RequestKind::ReadParameter { parameter_id } => {
+            Request::Version => {}
+            Request::ReadParameter { parameter_id } => {
                 buffer.write_u8(parameter_id.into())?;
             }
-            RequestKind::WriteParameter { parameter } => {
+            Request::WriteParameter { parameter } => {
                 buffer.write_u8(parameter.id().into())?;
                 parameter.write(buffer)?;
             }
-            RequestKind::DeviceState => {}
-            RequestKind::ApsDataIndication => {
+            Request::DeviceState => {}
+            Request::ApsDataIndication => {
                 buffer.write_u8(4)?;
             }
-            RequestKind::ApsDataRequest {
+            Request::ApsDataRequest {
                 request_id,
                 destination_address,
                 destination_endpoint,
@@ -215,15 +226,9 @@ impl RequestKind {
     }
 }
 
-#[derive(Debug)]
-pub struct Request {
-    pub sequence_id: SequenceId,
-    pub kind: RequestKind,
-}
-
 impl Request {
-    pub fn into_frame(self) -> Result<Vec<u8>> {
-        let payload_len = self.kind.payload_len();
+    pub fn into_frame(self, sequence_id: SequenceId) -> Result<Vec<u8>> {
+        let payload_len = self.payload_len();
         let mut frame_len = HEADER_LEN + payload_len;
         if payload_len > 0 {
             // Only include 2-byte payload length when there is a payload:
@@ -231,8 +236,8 @@ impl Request {
         }
 
         let mut buffer = Vec::with_capacity(usize::from(frame_len));
-        buffer.write_u8(self.kind.command_id().into())?;
-        buffer.write_u8(self.sequence_id)?;
+        buffer.write_u8(self.command_id().into())?;
+        buffer.write_u8(sequence_id)?;
         buffer.write_u8(0)?;
         buffer.write_u16::<LittleEndian>(frame_len)?;
 
@@ -240,14 +245,14 @@ impl Request {
             buffer.write_u16::<LittleEndian>(payload_len)?;
         }
 
-        self.kind.write_payload(&mut buffer)?;
+        self.write_payload(&mut buffer)?;
 
         Ok(buffer)
     }
 }
 
 #[derive(Debug)]
-pub enum ResponseKind {
+pub enum Response {
     Version {
         version: Version,
         platform: Platform,
@@ -266,14 +271,8 @@ pub enum ResponseKind {
     },
 }
 
-#[derive(Debug)]
-pub struct Response {
-    pub sequence_id: SequenceId,
-    pub kind: ResponseKind,
-}
-
 impl Response {
-    pub fn from_frame(frame: Vec<u8>) -> Result<Self> {
+    pub fn from_frame(frame: Vec<u8>) -> Result<(SequenceId, Self)> {
         let command_id = frame[0].try_into()?;
         let sequence_id = frame[1];
 
@@ -292,7 +291,7 @@ impl Response {
 
                 let version = Version { major, minor };
 
-                ResponseKind::Version { version, platform }
+                Response::Version { version, platform }
             }
             CommandId::ReadParameter => {
                 // Ignore payload length in message:
@@ -301,7 +300,7 @@ impl Response {
                 let parameter_id = ParameterId::try_from(payload[0])?;
                 let parameter = parameter_id.read_parameter(&payload[1..])?;
 
-                ResponseKind::Parameter(parameter)
+                Response::Parameter(parameter)
             }
             CommandId::WriteParameter => {
                 // Ignore payload length in message:
@@ -309,17 +308,17 @@ impl Response {
 
                 let parameter_id = ParameterId::try_from(payload[0])?;
 
-                ResponseKind::WriteParameter(parameter_id)
+                Response::WriteParameter(parameter_id)
             }
             CommandId::DeviceState => {
                 let device_state = DeviceState::from_byte(payload[0]);
 
-                ResponseKind::DeviceState(device_state)
+                Response::DeviceState(device_state)
             }
             CommandId::DeviceStateChanged => {
                 let device_state = DeviceState::from_byte(payload[0]);
 
-                ResponseKind::DeviceState(device_state)
+                Response::DeviceState(device_state)
             }
             CommandId::ApsDataIndication => {
                 use byteorder::ReadBytesExt;
@@ -366,7 +365,7 @@ impl Response {
                     asdu,
                 };
 
-                ResponseKind::ApsDataIndication(aps_data_indication)
+                Response::ApsDataIndication(aps_data_indication)
             }
             CommandId::ApsDataRequest => {
                 // Ignore payload length:
@@ -375,7 +374,7 @@ impl Response {
                 let device_state = DeviceState::from_byte(payload[0]);
                 let request_id = payload[1];
 
-                ResponseKind::ApsDataRequest {
+                Response::ApsDataRequest {
                     device_state,
                     request_id,
                 }
@@ -386,10 +385,10 @@ impl Response {
 
                 let address = LittleEndian::read_u16(payload);
 
-                ResponseKind::MacPoll { address }
+                Response::MacPoll { address }
             }
         };
 
-        Ok(Response { sequence_id, kind })
+        Ok((sequence_id, kind))
     }
 }

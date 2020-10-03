@@ -1,8 +1,8 @@
-use crate::ParameterId;
-use crate::SlipError;
+use crate::{ParameterId, SequenceId, SlipError};
 
 #[derive(Debug)]
 pub enum ErrorKind {
+    DuplicateSequenceId(SequenceId),
     UnsupportedCommand(u8),
     UnsupportedParameter(u8),
     InvalidParameter {
@@ -12,6 +12,7 @@ pub enum ErrorKind {
     Slip(SlipError),
     SerialPort(tokio_serial::Error),
     Io(std::io::Error),
+    ChannelError,
     Todo,
 }
 
@@ -41,6 +42,12 @@ impl From<SlipError> for Error {
         Error {
             kind: ErrorKind::Slip(other),
         }
+    }
+}
+
+impl From<ErrorKind> for Error {
+    fn from(kind: ErrorKind) -> Self {
+        Self { kind }
     }
 }
 
