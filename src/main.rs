@@ -167,7 +167,7 @@ struct Aps {
 impl Aps {
     async fn task(mut self) -> Result<()> {
         while let Some(device_state) = self.device_state.recv().await {
-            info!("aps: {:?}", device_state);
+            debug!("aps: {:?}", device_state);
 
             if device_state.data_indication {
                 let mut aps = self.clone();
@@ -235,7 +235,7 @@ where
 
     async fn process_frame(&mut self) -> Result<()> {
         let frame = self.reader.read_frame().await?;
-        info!("received = {:?}", frame);
+        debug!("received = {:?}", frame);
         let (sequence_id, response) = Response::from_frame(frame)?;
 
         self.broadcast_device_state(&response).await?;
@@ -321,7 +321,7 @@ where
     }
 
     async fn write_frame(&mut self, frame: Vec<u8>) -> Result<()> {
-        info!("sending = {:?}", frame);
+        debug!("sending = {:?}", frame);
         self.writer.write_frame(&frame).await?;
         Ok(())
     }
