@@ -22,7 +22,6 @@ pub enum ErrorKind {
         parameter_id: ParameterId,
         inner: Box<Error>,
     },
-    Boxed(Box<dyn std::error::Error>), // TODO: Get rid?
     Slip(SlipError),
     SerialPort(tokio_serial::Error),
     Io(std::io::Error),
@@ -46,14 +45,6 @@ impl From<tokio_serial::Error> for Error {
     fn from(other: tokio_serial::Error) -> Self {
         Error {
             kind: ErrorKind::SerialPort(other),
-        }
-    }
-}
-
-impl From<Box<dyn std::error::Error>> for Error {
-    fn from(other: Box<dyn std::error::Error>) -> Self {
-        Error {
-            kind: ErrorKind::Boxed(other),
         }
     }
 }
