@@ -109,7 +109,6 @@ impl CommandId {
     pub fn solicited(&self) -> bool {
         match self {
             CommandId::DeviceStateChanged => false,
-            CommandId::ApsDataIndication => false,
             _ => true,
         }
     }
@@ -266,7 +265,10 @@ pub enum Response {
     WriteParameter(ParameterId),
     DeviceState(DeviceState),
     DeviceStateChanged(DeviceState),
-    ApsDataIndication(ApsDataIndication),
+    ApsDataIndication {
+        device_state: DeviceState,
+        aps_data_indication: ApsDataIndication,
+    },
     ApsDataRequest {
         device_state: DeviceState,
         request_id: u8,
@@ -284,9 +286,23 @@ impl Response {
             Response::WriteParameter(_) => CommandId::WriteParameter,
             Response::DeviceState(_) => CommandId::DeviceState,
             Response::DeviceStateChanged(_) => CommandId::DeviceStateChanged,
-            Response::ApsDataIndication(_) => CommandId::ApsDataIndication,
+            Response::ApsDataIndication { .. } => CommandId::ApsDataIndication,
             Response::ApsDataRequest { .. } => CommandId::ApsDataRequest,
             Response::MacPoll { .. } => CommandId::MacPoll,
+        }
+    }
+
+    pub fn solicited(&self) -> bool {
+        self.command_id().solicited()
+    }
+
+    pub fn device_state(&self) -> Option<DeviceState> {
+        match self {
+            Response::DeviceState(device_state)
+            | Response::DeviceStateChanged(device_state)
+            | Response::ApsDataIndication { device_state, .. }
+            | Response::ApsDataRequest { device_state, .. } => Some(*device_state),
+            _ => None,
         }
     }
 
@@ -336,7 +352,7 @@ impl Response {
             CommandId::DeviceStateChanged => {
                 let device_state = DeviceState::from_byte(payload[0]);
 
-                Response::DeviceState(device_state)
+                Response::DeviceStateChanged(device_state)
             }
             CommandId::ApsDataIndication => {
                 use byteorder::ReadBytesExt;
@@ -373,7 +389,6 @@ impl Response {
                 payload.read(&mut asdu)?;
 
                 let aps_data_indication = ApsDataIndication {
-                    device_state,
                     destination_address,
                     destination_endpoint,
                     source_address,
@@ -383,7 +398,10 @@ impl Response {
                     asdu,
                 };
 
-                Response::ApsDataIndication(aps_data_indication)
+                Response::ApsDataIndication {
+                    device_state,
+                    aps_data_indication,
+                }
             }
             CommandId::ApsDataRequest => {
                 // Ignore payload length:

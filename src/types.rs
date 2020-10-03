@@ -35,6 +35,18 @@ pub struct DeviceState {
     pub configuration_changed: bool,
 }
 
+impl Default for DeviceState {
+    fn default() -> Self {
+        Self {
+            network_state: NetworkState::Offline,
+            data_confirm: false,
+            data_indication: false,
+            data_request_free_slots: false,
+            configuration_changed: false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum DestinationAddress {
     Group(ShortAddress),
@@ -50,7 +62,6 @@ pub struct SourceAddress {
 
 #[derive(Debug)]
 pub struct ApsDataIndication {
-    pub device_state: DeviceState,
     pub destination_address: DestinationAddress,
     pub destination_endpoint: Endpoint,
     pub source_address: SourceAddress,

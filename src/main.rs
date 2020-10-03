@@ -4,15 +4,17 @@ mod protocol;
 mod slip;
 mod types;
 
+#[macro_use]
+extern crate log;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
+use tokio::stream::{Stream, StreamExt};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_serial::{Serial, SerialPortSettings};
-
-use crate::protocol::RequestId;
 
 pub use crate::errors::{Error, ErrorKind, Result};
 pub use crate::parameters::{Parameter, ParameterId, PARAMETERS};
@@ -31,13 +33,18 @@ struct Command {
     sender: oneshot::Sender<Response>,
 }
 
-struct Conbee {
+struct Inner {
     commands: mpsc::Sender<Command>,
     request_id: AtomicU8,
 }
 
+#[derive(Clone)]
+struct Conbee {
+    inner: Arc<Inner>,
+}
+
 impl Conbee {
-    fn new<R, W>(reader: R, writer: W) -> Self
+    fn new<R, W>(reader: R, writer: W) -> (Self, ApsReader)
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
@@ -45,13 +52,26 @@ impl Conbee {
         let reader = slip::Reader::new(reader);
         let writer = slip::Writer::new(writer);
 
-        let (commands, commands_rx) = mpsc::channel(1);
+        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (device_state_tx, device_state_rx) = watch::channel(DeviceState::default());
+        let (aps_data_indications_tx, aps_data_indications_rx) = mpsc::channel(1);
+
         let request_id = Default::default();
+        let conbee = Self {
+            inner: Arc::new(Inner {
+                commands: commands_tx,
+                request_id,
+            }),
+        };
+        let aps_reader = ApsReader {
+            rx: aps_data_indications_rx,
+        };
 
         let shared = Arc::new(Shared::default());
         let rx = Rx {
             shared: shared.clone(),
             reader,
+            device_state: device_state_tx,
         };
         let tx = Tx {
             shared,
@@ -60,19 +80,24 @@ impl Conbee {
             sequence_id: 0,
         };
 
+        let aps = Aps {
+            conbee: conbee.clone(),
+            device_state: device_state_rx,
+            aps_data_indications: aps_data_indications_tx,
+        };
+
         tokio::spawn(rx.task());
         tokio::spawn(tx.task());
+        tokio::spawn(aps.task());
 
-        Self {
-            commands,
-            request_id,
-        }
+        (conbee, aps_reader)
     }
 
     async fn make_request(&self, request: Request) -> Result<Response> {
         let (sender, receiver) = oneshot::channel();
 
-        self.commands
+        self.inner
+            .commands
             .clone()
             .send(Command { request, sender })
             .await
@@ -99,7 +124,7 @@ impl Conbee {
 
     fn request_id(&self) -> u8 {
         // Could this be Ordering::Relaxed?
-        self.request_id.fetch_add(1, Ordering::SeqCst)
+        self.inner.request_id.fetch_add(1, Ordering::SeqCst)
     }
 
     pub async fn aps_data_request(&self, request: ApsDataRequest) -> Result<()> {
@@ -119,6 +144,67 @@ impl Conbee {
 
         Ok(())
     }
+
+    pub async fn aps_data_indication(&self) -> Result<ApsDataIndication> {
+        match self.make_request(Request::ApsDataIndication).await? {
+            Response::ApsDataIndication {
+                aps_data_indication,
+                ..
+            } => Ok(aps_data_indication),
+            resp => Err(ErrorKind::UnexpectedResponse(resp.command_id()).into()),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Aps {
+    conbee: Conbee,
+    device_state: watch::Receiver<DeviceState>,
+    aps_data_indications: mpsc::Sender<ApsDataIndication>,
+    // aps_data_confirms: mpsc::Sender<ApsDataIndication>,
+}
+
+impl Aps {
+    async fn task(mut self) -> Result<()> {
+        while let Some(device_state) = self.device_state.recv().await {
+            info!("aps: {:?}", device_state);
+
+            if device_state.data_indication {
+                let mut aps = self.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = aps.aps_data_indication().await {
+                        error!("aps_data_indication: {:?}", error);
+                    }
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn aps_data_indication(&mut self) -> Result<()> {
+        let aps_data_indication = self.conbee.aps_data_indication().await?;
+        self.aps_data_indications
+            .send(aps_data_indication)
+            .await
+            .map_err(|_| ErrorKind::ChannelError)?;
+        Ok(())
+    }
+}
+
+struct ApsReader {
+    rx: mpsc::Receiver<ApsDataIndication>,
+}
+
+impl Stream for ApsReader {
+    type Item = ApsDataIndication;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
 }
 
 #[derive(Default)]
@@ -132,6 +218,7 @@ where
 {
     shared: Arc<Shared>,
     reader: slip::Reader<R>,
+    device_state: watch::Sender<DeviceState>,
 }
 
 impl<R> Rx<R>
@@ -140,18 +227,43 @@ where
 {
     async fn task(mut self) -> Result<()> {
         loop {
-            let frame = self.reader.read_frame().await?;
-            println!("received = {:?}", frame);
-
-            // TODO: Think about where to send errors
-            let (sequence_id, response) = Response::from_frame(frame)?;
-
-            if let Some(sender) = self.shared.awaiting.lock().unwrap().remove(&sequence_id) {
-                sender.send(response).map_err(|_| ErrorKind::ChannelError)?;
-            } else {
-                println!("don't know where to send frame");
+            if let Err(error) = self.process_frame().await {
+                error!("rx: {:?}", error);
             }
         }
+    }
+
+    async fn process_frame(&mut self) -> Result<()> {
+        let frame = self.reader.read_frame().await?;
+        info!("received = {:?}", frame);
+        let (sequence_id, response) = Response::from_frame(frame)?;
+
+        self.broadcast_device_state(&response).await?;
+        if response.solicited() {
+            self.route_response(sequence_id, response).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn broadcast_device_state(&mut self, response: &Response) -> Result<()> {
+        if let Some(device_state) = response.device_state() {
+            self.device_state
+                .broadcast(device_state)
+                .map_err(|_| ErrorKind::ChannelError)?;
+        }
+        Ok(())
+    }
+
+    async fn route_response(&mut self, sequence_id: SequenceId, response: Response) -> Result<()> {
+        let mut awaiting = self.shared.awaiting.lock().unwrap();
+
+        match awaiting.remove(&sequence_id) {
+            Some(sender) => sender.send(response).map_err(|_| ErrorKind::ChannelError)?,
+            _ => error!("rx: unexpected response {:?}", response.command_id()),
+        }
+
+        Ok(())
     }
 }
 
@@ -170,22 +282,33 @@ where
     W: AsyncWrite + Unpin,
 {
     async fn task(mut self) -> Result<()> {
-        while let Some(Command { request, sender }) = self.commands.recv().await {
+        while let Some(command) = self.commands.recv().await {
             // TODO: Propagate errors back through the oneshot.
-            let sequence_id = self.sequence_id();
-            let frame = request.into_frame(sequence_id)?;
-
-            self.register_awaiting(sequence_id, sender);
-
-            self.write_frame(frame).await?;
+            if let Err(error) = self.process_command(command).await {
+                error!("tx: {:?}", error);
+            }
         }
 
         Ok(())
     }
 
+    async fn process_command(&mut self, command: Command) -> Result<()> {
+        let Command { request, sender } = command;
+
+        let sequence_id = self.sequence_id();
+        let frame = request.into_frame(sequence_id)?;
+
+        self.register_awaiting(sequence_id, sender);
+        self.write_frame(frame).await?;
+
+        Ok(())
+    }
+
     fn sequence_id(&mut self) -> SequenceId {
+        // Increment by 5 each time, as the Conbee stick seems to ignore some requests if the
+        // sequence ID matches the sequence ID of an unsolicited frame.
         let old = self.sequence_id;
-        self.sequence_id += 1;
+        self.sequence_id += 5;
         old
     }
 
@@ -198,7 +321,7 @@ where
     }
 
     async fn write_frame(&mut self, frame: Vec<u8>) -> Result<()> {
-        println!("sending = {:?}", frame);
+        info!("sending = {:?}", frame);
         self.writer.write_frame(&frame).await?;
         Ok(())
     }
@@ -206,6 +329,8 @@ where
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    pretty_env_logger::init();
+
     let args = std::env::args().collect::<Vec<_>>();
     let path = &args[1];
 
@@ -219,10 +344,10 @@ async fn main() -> Result<()> {
     )?;
 
     let (reader, writer) = tokio::io::split(tty);
-    let conbee = Conbee::new(reader, writer);
+    let (conbee, aps_reader) = Conbee::new(reader, writer);
 
-    let fut1 = conbee.version();
-    let fut2 = conbee.device_state();
+    // let fut1 = conbee.version();
+    // let fut2 = conbee.device_state();
     let fut3 = conbee.aps_data_request(ApsDataRequest {
         destination: Destination::Nwk(345, 0),
         profile_id: 0,
@@ -231,9 +356,18 @@ async fn main() -> Result<()> {
         asdu: vec![0x0, 0x59, 0x1],
     });
 
-    dbg!(fut2.await?);
-    dbg!(fut1.await?);
+    tokio::spawn(async move {
+        let mut aps_reader = aps_reader;
+        while let Some(aps_data_indication) = aps_reader.next().await {
+            dbg!(aps_data_indication);
+        }
+    });
+
+    // dbg!(fut2.await?);
+    // dbg!(fut1.await?);
     dbg!(fut3.await?);
+
+    loop {}
 
     Ok(())
 }
