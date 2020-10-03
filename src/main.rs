@@ -1,3 +1,4 @@
+mod errors;
 mod parameters;
 mod slip;
 
@@ -9,55 +10,13 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_serial::{Serial, SerialPort, SerialPortSettings};
 
 use crate::parameters::{Parameter, ParameterId, PARAMETERS};
-use crate::slip::{Reader, SlipError, Writer};
+use crate::slip::{Reader, Writer};
+
+pub use crate::errors::{Error, ErrorKind, Result};
+pub use crate::slip::SlipError;
 
 const BAUD: u32 = 38400;
 const HEADER_LEN: u16 = 5;
-
-#[derive(Debug)]
-pub enum ErrorKind {
-    UnsupportedCommand(u8),
-    UnsupportedParameter(u8),
-    InvalidParameter {
-        parameter_id: ParameterId,
-        inner: Box<Error>,
-    },
-    Slip(SlipError),
-    SerialPort(tokio_serial::Error),
-    Io(std::io::Error),
-    Todo,
-}
-
-#[derive(Debug)]
-pub struct Error {
-    kind: ErrorKind,
-}
-
-impl From<std::io::Error> for Error {
-    fn from(other: std::io::Error) -> Self {
-        Error {
-            kind: ErrorKind::Io(other),
-        }
-    }
-}
-
-impl From<tokio_serial::Error> for Error {
-    fn from(other: tokio_serial::Error) -> Self {
-        Error {
-            kind: ErrorKind::SerialPort(other),
-        }
-    }
-}
-
-impl From<SlipError> for Error {
-    fn from(other: SlipError) -> Self {
-        Error {
-            kind: ErrorKind::Slip(other),
-        }
-    }
-}
-
-type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Copy, Clone, Debug)]
 enum Platform {
