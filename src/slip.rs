@@ -1,24 +1,31 @@
-use std::io::{BufReader, BufWriter, Cursor, Read, Write};
+use std::convert::TryInto;
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use crate::Result;
 
 const END: u8 = 192;
 const ESC: u8 = 219;
 const ESC_END: u8 = 220;
 const ESC_ESC: u8 = 221;
 
+#[derive(Clone, Copy, Debug)]
+pub enum SlipError {
+    MissingCrc,
+    MismatchedCrc,
+    InvalidEscape,
+}
+
 pub struct Reader<R>
 where
-    R: Read,
+    R: AsyncRead + Unpin,
 {
     inner: BufReader<R>,
 }
 
 impl<R> Reader<R>
 where
-    R: Read,
+    R: AsyncRead + Unpin,
 {
     pub fn new(read: R) -> Self {
         Self {
@@ -26,9 +33,9 @@ where
         }
     }
 
-    fn read_byte(&mut self) -> Result<u8> {
+    async fn read_byte(&mut self) -> Result<u8> {
         let mut buf = [0; 1];
-        self.inner.read(&mut buf)?;
+        self.inner.read(&mut buf).await?;
         Ok(buf[0])
     }
 
@@ -36,10 +43,15 @@ where
         let len = frame.len() - 2;
 
         // Check CRC16 matches:
-        let mut cursor = Cursor::new(&frame[len..]);
-        let provided_crc = cursor.read_u16::<LittleEndian>()?;
+        let bytes = (&frame[len..])
+            .try_into()
+            .map_err(|_| SlipError::MissingCrc)?;
+        let provided_crc = u16::from_le_bytes(bytes);
         let calculated_crc = crc16(&frame[..len]);
-        assert_eq!(provided_crc, calculated_crc); // TODO: return error
+
+        if provided_crc != calculated_crc {
+            return Err(SlipError::MismatchedCrc.into());
+        }
 
         // Remove CRC16 bytes from returned frame:
         let mut frame = frame;
@@ -48,10 +60,10 @@ where
         Ok(frame)
     }
 
-    pub fn read_frame(&mut self) -> Result<Vec<u8>> {
+    pub async fn read_frame(&mut self) -> Result<Vec<u8>> {
         let mut frame = Vec::new();
         loop {
-            let mut byte = self.read_byte()?;
+            let mut byte = self.read_byte().await?;
 
             if byte == END {
                 // Skip END bytes at start of frame.
@@ -64,10 +76,10 @@ where
             }
 
             if byte == ESC {
-                byte = match self.read_byte()? {
+                byte = match self.read_byte().await? {
                     ESC_ESC => ESC,
                     ESC_END => END,
-                    _ => panic!(), // TODO: return error
+                    _ => return Err(SlipError::InvalidEscape.into()),
                 }
             }
 
@@ -78,14 +90,14 @@ where
 
 pub struct Writer<W>
 where
-    W: Write,
+    W: AsyncWrite + Unpin,
 {
     inner: BufWriter<W>,
 }
 
 impl<W> Writer<W>
 where
-    W: Write,
+    W: AsyncWrite + Unpin,
 {
     pub fn new(write: W) -> Self {
         Self {
@@ -93,34 +105,34 @@ where
         }
     }
 
-    fn write_byte(&mut self, byte: u8) -> Result<()> {
-        Ok(self.inner.write_u8(byte)?)
+    async fn write_byte(&mut self, byte: u8) -> Result<()> {
+        Ok(self.inner.write_u8(byte).await?)
     }
 
-    fn write_crc(&mut self, data: &[u8]) -> Result<()> {
+    async fn write_crc(&mut self, data: &[u8]) -> Result<()> {
         let crc = crc16(data);
-        self.inner.write_u16::<LittleEndian>(crc)?;
+        self.inner.write_u16_le(crc).await?;
         Ok(())
     }
 
-    pub fn write_frame(&mut self, data: &[u8]) -> Result<()> {
-        self.write_byte(END)?;
+    pub async fn write_frame(&mut self, data: &[u8]) -> Result<()> {
+        self.write_byte(END).await?;
         for byte in data {
             match *byte {
                 ESC => {
-                    self.write_byte(ESC)?;
-                    self.write_byte(ESC_ESC)?;
+                    self.write_byte(ESC).await?;
+                    self.write_byte(ESC_ESC).await?;
                 }
                 END => {
-                    self.write_byte(ESC)?;
-                    self.write_byte(ESC_END)?;
+                    self.write_byte(ESC).await?;
+                    self.write_byte(ESC_END).await?;
                 }
-                byte => self.write_byte(byte)?,
+                byte => self.write_byte(byte).await?,
             };
         }
-        self.write_crc(data)?;
-        self.write_byte(END)?;
-        self.inner.flush()?;
+        self.write_crc(data).await?;
+        self.write_byte(END).await?;
+        self.inner.flush().await?;
         Ok(())
     }
 }

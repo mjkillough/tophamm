@@ -8,5 +8,6 @@ edition = "2018"
 
 [dependencies]
 byteorder = "1.3"
-serialport = "3.3"
+tokio = { version = "0.2", features = ["full"] }
+tokio-serial = "4.3.3"
 

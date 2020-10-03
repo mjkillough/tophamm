@@ -2,12 +2,14 @@ mod parameters;
 mod slip;
 
 use std::convert::{TryFrom, TryInto};
+use std::pin::Pin;
 
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
-use serialport::{SerialPort, SerialPortSettings};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_serial::{Serial, SerialPort, SerialPortSettings};
 
 use crate::parameters::{Parameter, ParameterId, PARAMETERS};
-use crate::slip::{Reader, Writer};
+use crate::slip::{Reader, SlipError, Writer};
 
 const BAUD: u32 = 38400;
 const HEADER_LEN: u16 = 5;
@@ -21,7 +23,8 @@ pub enum ErrorKind {
         inner: Box<Error>,
     },
     Boxed(Box<dyn std::error::Error>), // TODO: Get rid?
-    SerialPort(serialport::Error),
+    Slip(SlipError),
+    SerialPort(tokio_serial::Error),
     Io(std::io::Error),
     Todo,
 }
@@ -39,8 +42,8 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<serialport::Error> for Error {
-    fn from(other: serialport::Error) -> Self {
+impl From<tokio_serial::Error> for Error {
+    fn from(other: tokio_serial::Error) -> Self {
         Error {
             kind: ErrorKind::SerialPort(other),
         }
@@ -51,6 +54,14 @@ impl From<Box<dyn std::error::Error>> for Error {
     fn from(other: Box<dyn std::error::Error>) -> Self {
         Error {
             kind: ErrorKind::Boxed(other),
+        }
+    }
+}
+
+impl From<SlipError> for Error {
+    fn from(other: SlipError) -> Self {
+        Error {
+            kind: ErrorKind::Slip(other),
         }
     }
 }
@@ -500,27 +511,35 @@ struct ApsDataIndication {
     asdu: Vec<u8>,
 }
 
-struct Conbee {
-    reader: Reader<Box<dyn SerialPort>>,
-    writer: Writer<Box<dyn SerialPort>>,
+struct Conbee<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    reader: Reader<R>,
+    writer: Writer<W>,
 }
 
-impl Conbee {
-    fn make_request(&mut self, request: Request) -> Result<Response> {
+impl<R, W> Conbee<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    async fn make_request(&mut self, request: Request) -> Result<Response> {
         println!("request = {:?}", request);
         let frame = request.into_frame()?;
         println!("sending = {:?}", frame);
-        self.writer.write_frame(&frame)?;
+        self.writer.write_frame(&frame).await?;
 
         println!("waiting for resp");
 
-        let response = self.receive_response()?;
+        let response = self.receive_response().await?;
 
         Ok(response)
     }
 
-    fn receive_response(&mut self) -> Result<Response> {
-        let frame = self.reader.read_frame()?;
+    async fn receive_response(&mut self) -> Result<Response> {
+        let frame = self.reader.read_frame().await?;
         println!("received = {:?}", frame);
         let response = Response::from_frame(frame)?;
         println!("response = {:?}", response);
@@ -528,11 +547,12 @@ impl Conbee {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     let path = &args[1];
 
-    let tty = serialport::open_with_settings(
+    let tty = Serial::from_path(
         path,
         &SerialPortSettings {
             baud_rate: BAUD,
@@ -541,17 +561,20 @@ fn main() -> Result<()> {
         },
     )?;
 
-    let reader = Reader::new(tty.try_clone()?);
-    let writer = Writer::new(tty);
+    let (reader, writer) = tokio::io::split(tty);
+    let reader = Reader::new(reader);
+    let writer = Writer::new(writer);
 
     let mut conbee = Conbee { reader, writer };
 
     let mut sequence_id = 1;
 
-    conbee.make_request(Request {
-        sequence_id,
-        kind: RequestKind::Version,
-    })?;
+    conbee
+        .make_request(Request {
+            sequence_id,
+            kind: RequestKind::Version,
+        })
+        .await?;
     sequence_id += 1;
 
     // conbee.make_request(Request {
@@ -578,24 +601,28 @@ fn main() -> Result<()> {
 
     let mut buf = [0; 3];
     LittleEndian::write_u16(&mut buf[1..], 345);
-    conbee.make_request(Request {
-        sequence_id,
-        kind: RequestKind::ApsDataRequest {
-            request_id: 1,
-            destination_address: DestinationAddress::Nwk(345),
-            destination_endpoint: Some(0),
-            profile_id: 0,
-            cluster_id: 5,
-            source_endpoint: 0,
-            asdu: buf.to_vec(),
-        },
-    })?;
+    conbee
+        .make_request(Request {
+            sequence_id,
+            kind: RequestKind::ApsDataRequest {
+                request_id: 1,
+                destination_address: DestinationAddress::Nwk(345),
+                destination_endpoint: Some(0),
+                profile_id: 0,
+                cluster_id: 5,
+                source_endpoint: 0,
+                asdu: buf.to_vec(),
+            },
+        })
+        .await?;
     sequence_id += 1;
 
-    let mut response = conbee.make_request(Request {
-        sequence_id,
-        kind: RequestKind::DeviceState,
-    })?;
+    let mut response = conbee
+        .make_request(Request {
+            sequence_id,
+            kind: RequestKind::DeviceState,
+        })
+        .await?;
     sequence_id += 1;
     loop {
         let data_indication = match response.kind {
@@ -605,20 +632,24 @@ fn main() -> Result<()> {
         };
 
         if dbg!(data_indication) {
-            conbee.make_request(Request {
-                sequence_id,
-                kind: RequestKind::ApsDataIndication,
-            })?;
+            conbee
+                .make_request(Request {
+                    sequence_id,
+                    kind: RequestKind::ApsDataIndication,
+                })
+                .await?;
             sequence_id += 1;
 
-            response = conbee.make_request(Request {
-                sequence_id,
-                kind: RequestKind::DeviceState,
-            })?;
+            response = conbee
+                .make_request(Request {
+                    sequence_id,
+                    kind: RequestKind::DeviceState,
+                })
+                .await?;
             sequence_id += 1;
         } else {
             // Wait for unsolicited DeviceStateChanged
-            response = conbee.receive_response()?;
+            response = conbee.receive_response().await?;
         }
     }
 
