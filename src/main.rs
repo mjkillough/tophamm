@@ -8,7 +8,6 @@ mod types;
 extern crate log;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -30,23 +29,25 @@ pub use crate::types::{
 
 const BAUD: u32 = 38400;
 
-struct Command {
+/// A command from Deconz to the Tx task, representing a serial Request using the Deconz protocol.
+struct SerialCommand {
     request: Request,
     sender: oneshot::Sender<Response>,
 }
 
+/// A command from Deconz to the Aps task, representing an ApsDataRequest.
 struct ApsCommand {
     request: ApsDataRequest,
     sender: oneshot::Sender<Result<ApsDataConfirm>>,
 }
 
 #[derive(Clone)]
-struct Conbee {
-    commands: mpsc::Sender<Command>,
+struct Deconz {
+    commands: mpsc::Sender<SerialCommand>,
     aps_data_requests: mpsc::Sender<ApsCommand>,
 }
 
-impl Conbee {
+impl Deconz {
     fn new<R, W>(reader: R, writer: W) -> (Self, ApsReader)
     where
         R: AsyncRead + Send + Unpin + 'static,
@@ -60,7 +61,7 @@ impl Conbee {
         let (aps_data_indications_tx, aps_data_indications_rx) = mpsc::channel(1);
         let (aps_data_requests_tx, aps_data_requests_rx) = mpsc::channel(1);
 
-        let conbee = Self {
+        let deconz = Self {
             commands: commands_tx,
             aps_data_requests: aps_data_requests_tx,
         };
@@ -82,7 +83,7 @@ impl Conbee {
         };
 
         let aps = Aps {
-            conbee: conbee.clone(),
+            deconz: deconz.clone(),
             request_id: 0,
             request_free_slots: false,
             device_state: device_state_rx,
@@ -95,7 +96,7 @@ impl Conbee {
         tokio::spawn(tx.task());
         tokio::spawn(aps.task());
 
-        (conbee, aps_reader)
+        (deconz, aps_reader)
     }
 
     async fn make_request(&self, request: Request) -> Result<Response> {
@@ -103,7 +104,7 @@ impl Conbee {
 
         self.commands
             .clone()
-            .send(Command { request, sender })
+            .send(SerialCommand { request, sender })
             .await
             .map_err(|_| ErrorKind::ChannelError)?;
 
@@ -142,8 +143,17 @@ impl Conbee {
     }
 }
 
+/// Task responsible for handlign all APS requests.
+///
+/// Listens to device state to decide when to:
+///
+///  - Forward ApsDataRequest to the adapter.
+///  - Request ApsDataIndications from the adapter, fowarding them to the ApsReader for the
+///    application to process.
+///  - Request ApsDataConfirms from the adapter, forwarding them to the future awaiting successful
+///    confirmation of an ApsDataRequest.
 struct Aps {
-    conbee: Conbee,
+    deconz: Deconz,
     request_id: RequestId,
     request_free_slots: bool,
     device_state: watch::Receiver<DeviceState>,
@@ -199,7 +209,7 @@ impl Aps {
     }
 
     async fn aps_data_indication(&mut self) -> Result<()> {
-        let response = self.conbee.make_request(Request::ApsDataIndication).await?;
+        let response = self.deconz.make_request(Request::ApsDataIndication).await?;
         let aps_data_indication = match response {
             Response::ApsDataIndication {
                 aps_data_indication,
@@ -217,7 +227,7 @@ impl Aps {
     }
 
     async fn aps_data_confirm(&mut self) -> Result<()> {
-        let response = self.conbee.make_request(Request::ApsDataConfirm).await?;
+        let response = self.deconz.make_request(Request::ApsDataConfirm).await?;
         let (request_id, aps_data_confirm) = match response {
             Response::ApsDataConfirm {
                 request_id,
@@ -241,7 +251,7 @@ impl Aps {
     async fn aps_data_request(&mut self, request: ApsDataRequest) -> Result<RequestId> {
         let request_id = self.request_id();
         let request = Request::ApsDataRequest(request_id, request);
-        let response = self.conbee.make_request(request).await?;
+        let response = self.deconz.make_request(request).await?;
 
         // We don't bother checking the request_id in the response, as the
         // sequence_id should be sufficient.
@@ -284,11 +294,16 @@ impl Stream for ApsReader {
     }
 }
 
+/// Shared state between the Rx and Tx tasks. Holds oneshots to send responses to.
 #[derive(Default)]
 struct Shared {
     awaiting: Mutex<HashMap<SequenceId, oneshot::Sender<Response>>>,
 }
 
+/// Task responsible for receiving responses from adapter over serial using the Deconz protocol.
+///
+/// Forwards responses to futures awaiting a response using the oneshots registered by Tx task.
+/// Broadcasts any update to DeviceState for other tasks (e.g. Aps) to respond to.
 struct Rx<R>
 where
     R: AsyncRead + Unpin,
@@ -344,13 +359,17 @@ where
     }
 }
 
+/// Task responsible for transmitting requests to adapter over serial using the Deconz protocol.
+///
+/// Registers oneshot receivers for each request, so that the Rx task can route responses to the
+/// correct future.
 struct Tx<W>
 where
     W: AsyncWrite + Unpin,
 {
     shared: Arc<Shared>,
     writer: slip::Writer<W>,
-    commands: mpsc::Receiver<Command>,
+    commands: mpsc::Receiver<SerialCommand>,
     sequence_id: u8,
 }
 
@@ -369,8 +388,8 @@ where
         Ok(())
     }
 
-    async fn process_command(&mut self, command: Command) -> Result<()> {
-        let Command { request, sender } = command;
+    async fn process_command(&mut self, command: SerialCommand) -> Result<()> {
+        let SerialCommand { request, sender } = command;
 
         let sequence_id = self.sequence_id();
         let frame = request.into_frame(sequence_id)?;
@@ -382,7 +401,7 @@ where
     }
 
     fn sequence_id(&mut self) -> SequenceId {
-        // Increment by 5 each time, as the Conbee stick seems to ignore some requests if the
+        // Increment by 5 each time, as the Deconz stick seems to ignore some requests if the
         // sequence ID matches the sequence ID of an unsolicited frame.
         let old = self.sequence_id;
         self.sequence_id += 5;
@@ -421,11 +440,11 @@ async fn main() -> Result<()> {
     )?;
 
     let (reader, writer) = tokio::io::split(tty);
-    let (conbee, aps_reader) = Conbee::new(reader, writer);
+    let (deconz, aps_reader) = Deconz::new(reader, writer);
 
-    // let fut1 = conbee.version();
-    let fut2 = conbee.device_state();
-    let fut3 = conbee.aps_data_request(ApsDataRequest {
+    // let fut1 = deconz.version();
+    let fut2 = deconz.device_state();
+    let fut3 = deconz.aps_data_request(ApsDataRequest {
         destination: Destination::Nwk(345, 0),
         profile_id: 0,
         cluster_id: 0x5,
@@ -445,6 +464,4 @@ async fn main() -> Result<()> {
     dbg!(fut3.await?);
 
     loop {}
-
-    Ok(())
 }
