@@ -16,14 +16,16 @@ use tokio::stream::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_serial::{Serial, SerialPortSettings};
 
+use crate::protocol::RequestId;
+
 pub use crate::errors::{Error, ErrorKind, Result};
 pub use crate::parameters::{Parameter, ParameterId, PARAMETERS};
 pub use crate::protocol::{CommandId, Request, Response};
 pub use crate::slip::SlipError;
 pub use crate::types::{
-    ApsDataIndication, ApsDataRequest, ClusterId, Destination, DestinationAddress, DeviceState,
-    Endpoint, ExtendedAddress, NetworkState, Platform, ProfileId, SequenceId, ShortAddress,
-    SourceAddress, Version,
+    ApsDataConfirm, ApsDataIndication, ApsDataRequest, ClusterId, Destination, DestinationAddress,
+    DeviceState, Endpoint, ExtendedAddress, NetworkState, Platform, ProfileId, SequenceId,
+    ShortAddress, SourceAddress, Version,
 };
 
 const BAUD: u32 = 38400;
@@ -33,14 +35,15 @@ struct Command {
     sender: oneshot::Sender<Response>,
 }
 
-struct Inner {
-    commands: mpsc::Sender<Command>,
-    request_id: AtomicU8,
+struct ApsCommand {
+    request: ApsDataRequest,
+    sender: oneshot::Sender<Result<ApsDataConfirm>>,
 }
 
 #[derive(Clone)]
 struct Conbee {
-    inner: Arc<Inner>,
+    commands: mpsc::Sender<Command>,
+    aps_data_requests: mpsc::Sender<ApsCommand>,
 }
 
 impl Conbee {
@@ -55,13 +58,11 @@ impl Conbee {
         let (commands_tx, commands_rx) = mpsc::channel(1);
         let (device_state_tx, device_state_rx) = watch::channel(DeviceState::default());
         let (aps_data_indications_tx, aps_data_indications_rx) = mpsc::channel(1);
+        let (aps_data_requests_tx, aps_data_requests_rx) = mpsc::channel(1);
 
-        let request_id = Default::default();
         let conbee = Self {
-            inner: Arc::new(Inner {
-                commands: commands_tx,
-                request_id,
-            }),
+            commands: commands_tx,
+            aps_data_requests: aps_data_requests_tx,
         };
         let aps_reader = ApsReader {
             rx: aps_data_indications_rx,
@@ -82,8 +83,12 @@ impl Conbee {
 
         let aps = Aps {
             conbee: conbee.clone(),
+            request_id: 0,
+            request_free_slots: false,
             device_state: device_state_rx,
             aps_data_indications: aps_data_indications_tx,
+            aps_data_requests: aps_data_requests_rx,
+            awaiting: HashMap::new(),
         };
 
         tokio::spawn(rx.task());
@@ -96,8 +101,7 @@ impl Conbee {
     async fn make_request(&self, request: Request) -> Result<Response> {
         let (sender, receiver) = oneshot::channel();
 
-        self.inner
-            .commands
+        self.commands
             .clone()
             .send(Command { request, sender })
             .await
@@ -122,50 +126,72 @@ impl Conbee {
         }
     }
 
-    fn request_id(&self) -> u8 {
-        // Could this be Ordering::Relaxed?
-        self.inner.request_id.fetch_add(1, Ordering::SeqCst)
-    }
+    pub async fn aps_data_request(&self, request: ApsDataRequest) -> Result<ApsDataConfirm> {
+        let (sender, receiver) = oneshot::channel();
 
-    pub async fn aps_data_request(&self, request: ApsDataRequest) -> Result<()> {
-        // TODO: check there are free slots.
+        self.aps_data_requests
+            .clone()
+            .send(ApsCommand { request, sender })
+            .await
+            .map_err(|_| ErrorKind::ChannelError)?;
 
-        let request_id = self.request_id();
-        let request = Request::ApsDataRequest(request_id, request);
-        let response = self.make_request(request).await?;
+        let result = receiver.await.map_err(|_| ErrorKind::ChannelError)?;
+        let aps_data_confirm = result?;
 
-        // We don't bother checking the request_id in the response, as the
-        // sequence_id should be sufficient.
-        if !matches!(response, Response::ApsDataRequest { .. }) {
-            return Err(ErrorKind::UnexpectedResponse(response.command_id()).into());
-        }
-
-        // TODO: Wait for confirm.
-
-        Ok(())
+        Ok(aps_data_confirm)
     }
 }
 
-#[derive(Clone)]
 struct Aps {
     conbee: Conbee,
+    request_id: RequestId,
+    request_free_slots: bool,
     device_state: watch::Receiver<DeviceState>,
+    aps_data_requests: mpsc::Receiver<ApsCommand>,
     aps_data_indications: mpsc::Sender<ApsDataIndication>,
-    // aps_data_confirms: mpsc::Sender<ApsDataIndication>,
+    awaiting: HashMap<RequestId, oneshot::Sender<Result<ApsDataConfirm>>>,
 }
 
 impl Aps {
     async fn task(mut self) -> Result<()> {
-        while let Some(device_state) = self.device_state.recv().await {
-            debug!("aps: {:?}", device_state);
+        loop {
+            tokio::select! {
+                Some(device_state) = self.device_state.recv() => {
+                    debug!("aps: {:?}", device_state);
 
-            if device_state.data_indication {
-                let mut aps = self.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = aps.aps_data_indication().await {
-                        error!("aps_data_indication: {:?}", error);
+                    self.request_free_slots = device_state.data_request_free_slots;
+
+                    if device_state.data_indication {
+                        if let Err(error) = self.aps_data_indication().await {
+                            error!("aps_data_indication: {:?}", error);
+                        }
                     }
-                });
+
+                    if device_state.data_confirm {
+                        if let Err(error) = self.aps_data_confirm().await {
+                            error!("aps_data_confirm: {:?}", error);
+                        }
+                    }
+                }
+                Some(ApsCommand { request, sender }) = self.aps_data_requests.recv(),
+                    if self.request_free_slots =>
+                {
+                    // Assume we can only send one message. We'll get a DeviceState in the response
+                    // which will tell us if we can send more.
+                    self.request_free_slots = false;
+
+                    match self.aps_data_request(request).await {
+                        Ok(request_id) => {
+                            self.awaiting.insert(request_id, sender);
+                        },
+                        Err(error) => {
+                            error!("aps_data_request: {:?}", error);
+                            let _ = sender.send(Err(error));
+                        }
+                    }
+
+                }
+                else => break,
             }
         }
 
@@ -187,6 +213,58 @@ impl Aps {
             .await
             .map_err(|_| ErrorKind::ChannelError)?;
 
+        Ok(())
+    }
+
+    async fn aps_data_confirm(&mut self) -> Result<()> {
+        let response = self.conbee.make_request(Request::ApsDataConfirm).await?;
+        let (request_id, aps_data_confirm) = match response {
+            Response::ApsDataConfirm {
+                request_id,
+                aps_data_confirm,
+                ..
+            } => (request_id, aps_data_confirm),
+            resp => return Err(ErrorKind::UnexpectedResponse(resp.command_id()).into()),
+        };
+
+        self.route_confirm(request_id, aps_data_confirm).await?;
+
+        Ok(())
+    }
+
+    fn request_id(&mut self) -> RequestId {
+        let old = self.request_id;
+        self.request_id += 1;
+        old
+    }
+
+    async fn aps_data_request(&mut self, request: ApsDataRequest) -> Result<RequestId> {
+        let request_id = self.request_id();
+        let request = Request::ApsDataRequest(request_id, request);
+        let response = self.conbee.make_request(request).await?;
+
+        // We don't bother checking the request_id in the response, as the
+        // sequence_id should be sufficient.
+        if !matches!(response, Response::ApsDataRequest { .. }) {
+            return Err(ErrorKind::UnexpectedResponse(response.command_id()).into());
+        }
+
+        Ok(request_id)
+    }
+
+    async fn route_confirm(
+        &mut self,
+        request_id: RequestId,
+        aps_data_confirm: ApsDataConfirm,
+    ) -> Result<()> {
+        match self.awaiting.remove(&request_id) {
+            Some(sender) => sender
+                .send(Ok(aps_data_confirm))
+                .map_err(|_| ErrorKind::ChannelError)?,
+            None => {
+                error!("don't know where to route response");
+            }
+        };
         Ok(())
     }
 }
@@ -346,7 +424,7 @@ async fn main() -> Result<()> {
     let (conbee, aps_reader) = Conbee::new(reader, writer);
 
     // let fut1 = conbee.version();
-    // let fut2 = conbee.device_state();
+    let fut2 = conbee.device_state();
     let fut3 = conbee.aps_data_request(ApsDataRequest {
         destination: Destination::Nwk(345, 0),
         profile_id: 0,
@@ -362,7 +440,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // dbg!(fut2.await?);
+    dbg!(fut2.await?);
     // dbg!(fut1.await?);
     dbg!(fut3.await?);
 

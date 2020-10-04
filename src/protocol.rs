@@ -1,10 +1,12 @@
 use std::convert::{TryFrom, TryInto};
+use std::io::{Cursor, Read};
 
-use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
+use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::{
-    ApsDataIndication, ApsDataRequest, Destination, DestinationAddress, DeviceState, NetworkState,
-    Parameter, ParameterId, Platform, SequenceId, SourceAddress, Version,
+    ApsDataConfirm, ApsDataIndication, ApsDataRequest, Destination, DestinationAddress,
+    DeviceState, NetworkState, Parameter, ParameterId, Platform, SequenceId, SourceAddress,
+    Version,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -86,6 +88,23 @@ impl Destination {
         }
         Ok(())
     }
+
+    fn from_payload(payload: &mut Cursor<&[u8]>) -> Result<Self> {
+        match payload.read_u8()? {
+            0x1 => Ok(Destination::Group(payload.read_u16::<LittleEndian>()?)),
+            0x2 => {
+                let short_address = payload.read_u16::<LittleEndian>()?;
+                let endpoint = payload.read_u8()?;
+                Ok(Destination::Nwk(short_address, endpoint))
+            }
+            0x3 => {
+                let extended_address = payload.read_u64::<LittleEndian>()?;
+                let endpoint = payload.read_u8()?;
+                Ok(Destination::Ieee(extended_address, endpoint))
+            }
+            _ => unreachable!("invalid address mode"),
+        }
+    }
 }
 
 pub type RequestId = u8;
@@ -99,6 +118,7 @@ pub enum CommandId {
     DeviceStateChanged,
     ApsDataIndication,
     ApsDataRequest,
+    ApsDataConfirm,
 
     // https://github.com/dresden-elektronik/deconz-rest-plugin/issues/652#issuecomment-400055215
     MacPoll,
@@ -124,6 +144,7 @@ impl From<CommandId> for u8 {
             CommandId::DeviceStateChanged => 0x0E,
             CommandId::ApsDataIndication => 0x17,
             CommandId::ApsDataRequest => 0x12,
+            CommandId::ApsDataConfirm => 0x04,
             CommandId::MacPoll => 0x1C,
         }
     }
@@ -142,6 +163,7 @@ impl TryFrom<u8> for CommandId {
             0x1C => Ok(CommandId::MacPoll),
             0x17 => Ok(CommandId::ApsDataIndication),
             0x12 => Ok(CommandId::ApsDataRequest),
+            0x04 => Ok(CommandId::ApsDataConfirm),
             _ => Err(Error {
                 kind: ErrorKind::UnsupportedCommand(byte),
             }),
@@ -157,6 +179,7 @@ pub enum Request {
     DeviceState,
     ApsDataIndication,
     ApsDataRequest(RequestId, ApsDataRequest),
+    ApsDataConfirm,
 }
 
 impl Request {
@@ -168,22 +191,25 @@ impl Request {
             Request::DeviceState => CommandId::DeviceState,
             Request::ApsDataIndication => CommandId::ApsDataIndication,
             Request::ApsDataRequest(_, _) => CommandId::ApsDataRequest,
+            Request::ApsDataConfirm => CommandId::ApsDataConfirm,
         }
     }
 
-    fn payload_len(&self) -> u16 {
+    fn payload_len(&self) -> Option<u16> {
         match self {
-            Request::Version => 0,
-            Request::ReadParameter { .. } => 1,
-            Request::WriteParameter { parameter } => 1 + parameter.len(),
-            Request::DeviceState => 0,
-            Request::ApsDataIndication => 1,
+            Request::Version => None,
+            Request::ReadParameter { .. } => Some(1),
+            Request::WriteParameter { parameter } => Some(1 + parameter.len()),
+            Request::DeviceState => None,
+            Request::ApsDataIndication => Some(1),
             Request::ApsDataRequest(
                 _,
                 ApsDataRequest {
                     destination, asdu, ..
                 },
-            ) => 12 + destination.payload_len() + (asdu.len() as u16),
+            ) => Some(12 + destination.payload_len() + (asdu.len() as u16)),
+            // Include payload len even though it is zero:
+            Request::ApsDataConfirm => Some(0),
         }
     }
 
@@ -224,6 +250,7 @@ impl Request {
                 buffer.write_u8(0x04)?; // tx options, use aps acks
                 buffer.write_u8(0)?; // radius, infinite hops
             }
+            Request::ApsDataConfirm => {}
         }
 
         Ok(())
@@ -233,10 +260,13 @@ impl Request {
 impl Request {
     pub fn into_frame(self, sequence_id: SequenceId) -> Result<Vec<u8>> {
         let payload_len = self.payload_len();
-        let mut frame_len = HEADER_LEN + payload_len;
-        if payload_len > 0 {
+        let mut frame_len = HEADER_LEN;
+        if let Some(payload_len) = payload_len {
             // Only include 2-byte payload length when there is a payload:
+            // 2 byte payload len:
             frame_len += 2;
+            // Payload:
+            frame_len += payload_len;
         }
 
         let mut buffer = Vec::with_capacity(usize::from(frame_len));
@@ -245,7 +275,7 @@ impl Request {
         buffer.write_u8(0)?;
         buffer.write_u16::<LittleEndian>(frame_len)?;
 
-        if payload_len > 0 {
+        if let Some(payload_len) = payload_len {
             buffer.write_u16::<LittleEndian>(payload_len)?;
         }
 
@@ -271,7 +301,12 @@ pub enum Response {
     },
     ApsDataRequest {
         device_state: DeviceState,
-        request_id: u8,
+        request_id: RequestId,
+    },
+    ApsDataConfirm {
+        device_state: DeviceState,
+        request_id: RequestId,
+        aps_data_confirm: ApsDataConfirm,
     },
     MacPoll {
         address: u16,
@@ -288,6 +323,7 @@ impl Response {
             Response::DeviceStateChanged(_) => CommandId::DeviceStateChanged,
             Response::ApsDataIndication { .. } => CommandId::ApsDataIndication,
             Response::ApsDataRequest { .. } => CommandId::ApsDataRequest,
+            Response::ApsDataConfirm { .. } => CommandId::ApsDataConfirm,
             Response::MacPoll { .. } => CommandId::MacPoll,
         }
     }
@@ -355,11 +391,7 @@ impl Response {
                 Response::DeviceStateChanged(device_state)
             }
             CommandId::ApsDataIndication => {
-                use byteorder::ReadBytesExt;
-                use std::io::{Cursor, Read};
-
                 let mut payload = Cursor::new(payload);
-
                 let _payload_len = payload.read_u16::<LittleEndian>()?;
 
                 let device_state = DeviceState::from_byte(payload.read_u8()?);
@@ -422,6 +454,28 @@ impl Response {
                 let address = LittleEndian::read_u16(payload);
 
                 Response::MacPoll { address }
+            }
+            CommandId::ApsDataConfirm => {
+                let mut payload = Cursor::new(payload);
+                let _payload_len = payload.read_u16::<LittleEndian>()?;
+
+                let device_state = DeviceState::from_byte(payload.read_u8()?);
+                let request_id = payload.read_u8()?;
+                let destination = Destination::from_payload(&mut payload)?;
+                let source_endpoint = payload.read_u8()?;
+                let status = payload.read_u8()?;
+
+                let aps_data_confirm = ApsDataConfirm {
+                    destination,
+                    source_endpoint,
+                    status,
+                };
+
+                Response::ApsDataConfirm {
+                    device_state,
+                    request_id,
+                    aps_data_confirm,
+                }
             }
         };
 

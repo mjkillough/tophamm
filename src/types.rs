@@ -86,3 +86,10 @@ pub struct ApsDataRequest {
     pub source_endpoint: Endpoint,
     pub asdu: Vec<u8>,
 }
+
+#[derive(Debug)]
+pub struct ApsDataConfirm {
+    pub destination: Destination,
+    pub source_endpoint: Endpoint,
+    pub status: u8,
+}
