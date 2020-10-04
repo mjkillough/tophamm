@@ -8,6 +8,7 @@ mod types;
 extern crate log;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -42,13 +43,13 @@ struct ApsCommand {
 }
 
 #[derive(Clone)]
-struct Deconz {
+pub struct Deconz {
     commands: mpsc::Sender<SerialCommand>,
     aps_data_requests: mpsc::Sender<ApsCommand>,
 }
 
 impl Deconz {
-    fn new<R, W>(reader: R, writer: W) -> (Self, ApsReader)
+    pub fn new<R, W>(reader: R, writer: W) -> (Self, ApsReader)
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
@@ -279,7 +280,7 @@ impl Aps {
     }
 }
 
-struct ApsReader {
+pub struct ApsReader {
     rx: mpsc::Receiver<ApsDataIndication>,
 }
 
@@ -423,13 +424,10 @@ where
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    pretty_env_logger::init();
-
-    let args = std::env::args().collect::<Vec<_>>();
-    let path = &args[1];
-
+pub fn open_tty<P>(path: P) -> Result<(Deconz, ApsReader)>
+where
+    P: AsRef<Path>,
+{
     let tty = Serial::from_path(
         path,
         &SerialPortSettings {
@@ -440,7 +438,17 @@ async fn main() -> Result<()> {
     )?;
 
     let (reader, writer) = tokio::io::split(tty);
-    let (deconz, aps_reader) = Deconz::new(reader, writer);
+    Ok(Deconz::new(reader, writer))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    pretty_env_logger::init();
+
+    let args = std::env::args().collect::<Vec<_>>();
+    let path = &args[1];
+
+    let (deconz, aps_reader) = open_tty(path)?;
 
     // let fut1 = deconz.version();
     let fut2 = deconz.device_state();
