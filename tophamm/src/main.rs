@@ -163,6 +163,49 @@ impl Tx {
 }
 
 #[derive(Debug)]
+struct ActiveEpRequest {
+    addr: ShortAddress,
+}
+
+impl Request for ActiveEpRequest {
+    const CLUSTER_ID: ClusterId = 0x0005;
+    type Response = ActiveEpResponse;
+
+    fn into_frame(self, frame: &mut Vec<u8>) -> Result<()> {
+        frame.write_u16::<LittleEndian>(self.addr)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ActiveEpResponse {
+    status: u8,
+    addr: ShortAddress,
+    active_endpoints: Vec<Endpoint>,
+}
+
+impl Response for ActiveEpResponse {
+    const CLUSTER_ID: ClusterId = 0x8005;
+
+    fn from_frame(mut frame: Cursor<&[u8]>) -> Result<Self> {
+        let status = frame.read_u8()?;
+        let addr = frame.read_u16::<LittleEndian>()?;
+
+        let count = frame.read_u8()?;
+        let mut active_endpoints = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            active_endpoints.push(frame.read_u8()?);
+        }
+
+        Ok(ActiveEpResponse {
+            status,
+            addr,
+            active_endpoints,
+        })
+    }
+}
+
+#[derive(Debug)]
 struct MgmtLqiRequest {
     start_index: u8,
 }
@@ -302,6 +345,28 @@ struct Neighbor {
     link_quality_index: u8,
 }
 
+async fn get_neighbors(zdo: &Zdo, destination: Destination) -> Result<Vec<Neighbor>> {
+    let mut start_index = 0;
+    let mut neighbors = Vec::new();
+
+    loop {
+        let resp = zdo
+            .make_request(destination, MgmtLqiRequest { start_index })
+            .await?;
+        dbg!(&resp);
+        let total = resp.neighbor_table_entries as usize;
+        let count = resp.neighbor_table_list.len() as u8;
+
+        neighbors.extend(resp.neighbor_table_list);
+
+        if neighbors.len() >= total {
+            return Ok(neighbors);
+        }
+
+        start_index += count;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     pretty_env_logger::init();
@@ -341,14 +406,7 @@ async fn main() -> Result<()> {
 
     dbg!(fut2.await?);
 
-    let resp = zdo
-        .make_request(Destination::Nwk(0x0, 0), MgmtLqiRequest { start_index: 0 })
-        .await?;
-    dbg!(resp);
-    let resp = zdo
-        .make_request(Destination::Nwk(0x0, 0), MgmtLqiRequest { start_index: 2 })
-        .await?;
-    dbg!(resp);
+    dbg!(get_neighbors(&zdo, Destination::Nwk(0x0, 0)).await?);
 
     // dbg!(fut1.await?);
     // dbg!(fut3.await?);

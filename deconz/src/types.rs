@@ -91,6 +91,7 @@ pub struct ApsDataIndication {
     pub asdu: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
 pub enum Destination {
     Group(ShortAddress),
     Nwk(ShortAddress, Endpoint),
