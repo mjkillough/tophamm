@@ -260,7 +260,7 @@ where
         // Increment by 5 each time, as the Deconz stick seems to ignore some requests if the
         // sequence ID matches the sequence ID of an unsolicited frame.
         let old = self.sequence_id;
-        self.sequence_id += 5;
+        self.sequence_id = (self.sequence_id + 5) % 255;
         old
     }
 

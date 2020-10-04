@@ -88,6 +88,7 @@ impl Zdo {
         let aps_data_indication = result?;
 
         // Skip tx_id
+        // TODO: assert cluster ID?
         let cursor = Cursor::new(&aps_data_indication.asdu[1..]);
         let response = R::Response::from_frame(cursor)?;
 
@@ -147,8 +148,6 @@ impl Tx {
                     error!("zdo tx: {}", error);
                     shared.awaiting.lock().unwrap().remove(&tx_id);
                 }
-
-                info!("sent: {}", tx_id);
             });
         }
 
@@ -160,6 +159,83 @@ impl Tx {
         self.tx_id += 1;
         old
     }
+}
+
+#[derive(Debug)]
+struct SimpleDescRequest {
+    addr: ShortAddress,
+    endpoint: Endpoint,
+}
+
+impl Request for SimpleDescRequest {
+    const CLUSTER_ID: ClusterId = 0x0004;
+    type Response = SimpleDescResponse;
+
+    fn into_frame(self, frame: &mut Vec<u8>) -> Result<()> {
+        frame.write_u16::<LittleEndian>(self.addr)?;
+        frame.write_u8(self.endpoint)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct SimpleDescResponse {
+    status: u8,
+    addr: ShortAddress,
+    simple_descriptor: SimpleDescriptor,
+}
+
+impl Response for SimpleDescResponse {
+    const CLUSTER_ID: ClusterId = 0x8004;
+
+    fn from_frame(mut frame: Cursor<&[u8]>) -> Result<Self> {
+        let status = frame.read_u8()?;
+        let addr = frame.read_u16::<LittleEndian>()?;
+        let _len = frame.read_u8()?;
+
+        let endpoint = frame.read_u8()?;
+        let profile = frame.read_u16::<LittleEndian>()?;
+        let device_identifier = frame.read_u16::<LittleEndian>()?;
+        let device_version = frame.read_u8()?;
+
+        let input_count = frame.read_u8()?;
+        let mut input_clusters = Vec::with_capacity(usize::from(input_count));
+        for _ in 0..input_count {
+            input_clusters.push(frame.read_u16::<LittleEndian>()?);
+        }
+
+        let output_count = frame.read_u8()?;
+        let mut output_clusters = Vec::with_capacity(usize::from(output_count));
+        for _ in 0..output_count {
+            output_clusters.push(frame.read_u16::<LittleEndian>()?);
+        }
+
+        let simple_descriptor = SimpleDescriptor {
+            endpoint,
+            profile,
+            device_identifier,
+            device_version,
+            input_clusters,
+            output_clusters,
+        };
+
+        Ok(SimpleDescResponse {
+            status,
+            addr,
+            simple_descriptor,
+        })
+    }
+}
+
+// pg 96
+#[derive(Debug)]
+struct SimpleDescriptor {
+    endpoint: Endpoint,
+    profile: ProfileId,
+    device_identifier: u16,
+    device_version: u8, // 4 bits
+    input_clusters: Vec<ClusterId>,
+    output_clusters: Vec<ClusterId>,
 }
 
 #[derive(Debug)]
@@ -367,6 +443,26 @@ async fn get_neighbors(zdo: &Zdo, destination: Destination) -> Result<Vec<Neighb
     }
 }
 
+async fn query_endpoints(
+    zdo: &Zdo,
+    addr: ShortAddress,
+) -> Result<Vec<(Endpoint, SimpleDescriptor)>> {
+    let destination = Destination::Nwk(addr, 0);
+    let resp = zdo
+        .make_request(destination, ActiveEpRequest { addr })
+        .await?;
+
+    let mut active_endpoints = Vec::with_capacity(resp.active_endpoints.len());
+    for endpoint in resp.active_endpoints {
+        let resp = zdo
+            .make_request(destination, SimpleDescRequest { addr, endpoint })
+            .await?;
+        active_endpoints.push((endpoint, resp.simple_descriptor));
+    }
+
+    Ok(active_endpoints)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     pretty_env_logger::init();
@@ -388,10 +484,10 @@ async fn main() -> Result<()> {
 
         while let Some(aps_data_indication) = aps_reader.next().await {
             if aps_data_indication.destination_endpoint == 0 {
-                info!("zdo frame: {:?}", aps_data_indication);
+                debug!("zdo frame: {:?}", aps_data_indication);
                 zdo_tx.send(aps_data_indication).await.unwrap()
             } else {
-                info!("other frame: {:?}", aps_data_indication);
+                debug!("other frame: {:?}", aps_data_indication);
             }
         }
     });
@@ -406,7 +502,13 @@ async fn main() -> Result<()> {
 
     dbg!(fut2.await?);
 
-    dbg!(get_neighbors(&zdo, Destination::Nwk(0x0, 0)).await?);
+    for neighbor in get_neighbors(&zdo, Destination::Nwk(0x0, 0)).await? {
+        let endpoints = query_endpoints(&zdo, neighbor.network_address).await?;
+        info!(
+            "neighbor = {:#04x}, endpoints = {:?}",
+            neighbor.network_address, endpoints
+        );
+    }
 
     // dbg!(fut1.await?);
     // dbg!(fut3.await?);
