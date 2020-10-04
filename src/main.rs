@@ -144,16 +144,6 @@ impl Conbee {
 
         Ok(())
     }
-
-    pub async fn aps_data_indication(&self) -> Result<ApsDataIndication> {
-        match self.make_request(Request::ApsDataIndication).await? {
-            Response::ApsDataIndication {
-                aps_data_indication,
-                ..
-            } => Ok(aps_data_indication),
-            resp => Err(ErrorKind::UnexpectedResponse(resp.command_id()).into()),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -183,11 +173,20 @@ impl Aps {
     }
 
     async fn aps_data_indication(&mut self) -> Result<()> {
-        let aps_data_indication = self.conbee.aps_data_indication().await?;
+        let response = self.conbee.make_request(Request::ApsDataIndication).await?;
+        let aps_data_indication = match response {
+            Response::ApsDataIndication {
+                aps_data_indication,
+                ..
+            } => aps_data_indication,
+            resp => return Err(ErrorKind::UnexpectedResponse(resp.command_id()).into()),
+        };
+
         self.aps_data_indications
             .send(aps_data_indication)
             .await
             .map_err(|_| ErrorKind::ChannelError)?;
+
         Ok(())
     }
 }
