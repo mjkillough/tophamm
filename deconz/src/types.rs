@@ -1,3 +1,5 @@
+use std::fmt::{self, Debug};
+
 pub type SequenceId = u8;
 pub type Endpoint = u8;
 pub type ProfileId = u16;
@@ -47,17 +49,35 @@ impl Default for DeviceState {
     }
 }
 
-#[derive(Debug)]
 pub enum DestinationAddress {
     Group(ShortAddress),
     Nwk(ShortAddress),
     Ieee(ExtendedAddress),
 }
 
-#[derive(Debug)]
+impl Debug for DestinationAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DestinationAddress::Group(addr) => write!(f, "Group({:#04x})", addr),
+            DestinationAddress::Nwk(addr) => write!(f, "Nwk({:#04x})", addr),
+            DestinationAddress::Ieee(addr) => write!(f, "Ieee({:#016x})", addr),
+        }
+    }
+}
+
 pub struct SourceAddress {
     pub short: ShortAddress,
     pub extended: ExtendedAddress,
+}
+
+impl Debug for SourceAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SourceAddress({:#04x}, {:#016x})",
+            self.short, self.extended
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -71,11 +91,22 @@ pub struct ApsDataIndication {
     pub asdu: Vec<u8>,
 }
 
-#[derive(Debug)]
 pub enum Destination {
     Group(ShortAddress),
     Nwk(ShortAddress, Endpoint),
     Ieee(ExtendedAddress, Endpoint),
+}
+
+impl Debug for Destination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Destination::Group(addr) => write!(f, "Group({:#04x})", addr),
+            Destination::Nwk(addr, endpoint) => write!(f, "Nwk({:#04x}, {:#02x})", addr, endpoint),
+            Destination::Ieee(addr, endpoint) => {
+                write!(f, "Ieee({:#016x}, {:#02x})", addr, endpoint)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
