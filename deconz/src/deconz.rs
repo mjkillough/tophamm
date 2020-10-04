@@ -146,7 +146,7 @@ where
     async fn task(mut self) -> Result<()> {
         loop {
             if let Err(error) = self.process_frame().await {
-                error!("rx: {:?}", error);
+                error!("rx: {}", error);
             }
         }
     }
@@ -178,7 +178,7 @@ where
 
         match awaiting.remove(&sequence_id) {
             Some(sender) => sender.send(response).map_err(|_| ErrorKind::ChannelError)?,
-            _ => error!("rx: unexpected response {:?}", response.command_id()),
+            _ => error!("rx: unexpected response {}", response.command_id()),
         }
 
         Ok(())
@@ -207,7 +207,7 @@ where
         while let Some(command) = self.commands.recv().await {
             // TODO: Propagate errors back through the oneshot.
             if let Err(error) = self.process_command(command).await {
-                error!("tx: {:?}", error);
+                error!("tx: {}", error);
             }
         }
 

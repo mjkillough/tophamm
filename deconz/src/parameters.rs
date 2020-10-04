@@ -1,4 +1,5 @@
 use std::convert::TryFrom;
+use std::fmt::{self, Display};
 use std::io::{Cursor, Write};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -59,6 +60,14 @@ macro_rules! define_parameters {
                             Ok(Parameter::$param(param))
                         }
                     )+
+                }
+            }
+        }
+
+        impl Display for ParameterId {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    $(ParameterId::$param => write!(f, "{} ({})", stringify!($param), $id)),+
                 }
             }
         }

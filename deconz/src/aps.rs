@@ -45,13 +45,13 @@ impl Aps {
 
                     if device_state.data_indication {
                         if let Err(error) = self.aps_data_indication().await {
-                            error!("aps_data_indication: {:?}", error);
+                            error!("aps_data_indication: {}", error);
                         }
                     }
 
                     if device_state.data_confirm {
                         if let Err(error) = self.aps_data_confirm().await {
-                            error!("aps_data_confirm: {:?}", error);
+                            error!("aps_data_confirm: {}", error);
                         }
                     }
                 }
@@ -67,7 +67,7 @@ impl Aps {
                             self.awaiting.insert(request_id, sender);
                         },
                         Err(error) => {
-                            error!("aps_data_request: {:?}", error);
+                            error!("aps_data_request: {}", error);
                             let _ = sender.send(Err(error));
                         }
                     }

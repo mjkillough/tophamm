@@ -1,4 +1,5 @@
 use std::convert::{TryFrom, TryInto};
+use std::fmt::{self, Display};
 use std::io::{Cursor, Read};
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -167,6 +168,22 @@ impl TryFrom<u8> for CommandId {
             _ => Err(Error {
                 kind: ErrorKind::UnsupportedCommand(byte),
             }),
+        }
+    }
+}
+
+impl Display for CommandId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CommandId::Version => write!(f, "Version ({})", u8::from(*self)),
+            CommandId::ReadParameter => write!(f, "ReadParameter ({})", u8::from(*self)),
+            CommandId::WriteParameter => write!(f, "WriteParameter ({})", u8::from(*self)),
+            CommandId::DeviceState => write!(f, "DeviceState ({})", u8::from(*self)),
+            CommandId::DeviceStateChanged => write!(f, "DeviceStateChanged ({})", u8::from(*self)),
+            CommandId::MacPoll => write!(f, "MacPoll ({})", u8::from(*self)),
+            CommandId::ApsDataIndication => write!(f, "ApsDataIndication ({})", u8::from(*self)),
+            CommandId::ApsDataRequest => write!(f, "ApsDataRequest ({})", u8::from(*self)),
+            CommandId::ApsDataConfirm => write!(f, "ApsDataConfirm ({})", u8::from(*self)),
         }
     }
 }

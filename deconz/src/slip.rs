@@ -1,4 +1,5 @@
 use std::convert::TryInto;
+use std::fmt::{self, Display};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 
@@ -15,6 +16,18 @@ pub enum SlipError {
     MismatchedCrc,
     InvalidEscape,
 }
+
+impl Display for SlipError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SlipError::MissingCrc => write!(f, "missing CRC"),
+            SlipError::MismatchedCrc => write!(f, "mismatched CRC"),
+            SlipError::InvalidEscape => write!(f, "invalid escape sequence"),
+        }
+    }
+}
+
+impl std::error::Error for SlipError {}
 
 pub struct Reader<R>
 where
