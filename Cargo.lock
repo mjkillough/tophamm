@@ -554,6 +554,7 @@ name = "tophamm"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "byteorder",
  "deconz",
  "log",
  "pretty_env_logger",
