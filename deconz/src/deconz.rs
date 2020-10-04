@@ -7,14 +7,14 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::aps::{Aps, ApsCommand, ApsReader};
 use crate::slip;
 use crate::{
-    ApsDataConfirm, ApsDataRequest, DeviceState, ErrorKind, Platform, Request, Response, Result,
-    SequenceId, Version,
+    ApsDataConfirm, ApsDataRequest, DeviceState, Error, ErrorKind, Platform, Request, Response,
+    Result, SequenceId, Version,
 };
 
 /// A command from Deconz to the Tx task, representing a serial Request using the Deconz protocol.
 struct SerialCommand {
     request: Request,
-    sender: oneshot::Sender<Response>,
+    sender: oneshot::Sender<Result<Response>>,
 }
 
 #[derive(Clone)]
@@ -84,7 +84,8 @@ impl Deconz {
             .await
             .map_err(|_| ErrorKind::ChannelError)?;
 
-        let response = receiver.await.map_err(|_| ErrorKind::ChannelError)?;
+        let result = receiver.await.map_err(|_| ErrorKind::ChannelError)?;
+        let response = result?;
 
         Ok(response)
     }
@@ -123,7 +124,7 @@ impl Deconz {
 /// Shared state between the Rx and Tx tasks. Holds oneshots to send responses to.
 #[derive(Default)]
 struct Shared {
-    awaiting: Mutex<HashMap<SequenceId, oneshot::Sender<Response>>>,
+    awaiting: Mutex<HashMap<SequenceId, oneshot::Sender<Result<Response>>>>,
 }
 
 /// Task responsible for receiving responses from adapter over serial using the Deconz protocol.
@@ -145,20 +146,40 @@ where
 {
     async fn task(mut self) -> Result<()> {
         loop {
-            if let Err(error) = self.process_frame().await {
-                error!("rx: {}", error);
+            let frame = match self.read_frame().await {
+                Ok(frame) => frame,
+                Err(error) => {
+                    error!("rx read _frame: {}", error);
+                    continue;
+                }
+            };
+
+            if let Err(error) = self.process_frame(frame).await {
+                error!("rx process_frame: {}", error);
             }
         }
     }
 
-    async fn process_frame(&mut self) -> Result<()> {
+    async fn read_frame(&mut self) -> Result<Vec<u8>> {
         let frame = self.reader.read_frame().await?;
         debug!("received = {:?}", frame);
-        let (sequence_id, response) = Response::from_frame(frame)?;
 
-        self.broadcast_device_state(&response).await?;
-        if response.solicited() {
-            self.route_response(sequence_id, response).await?;
+        Ok(frame)
+    }
+
+    async fn process_frame(&mut self, frame: Vec<u8>) -> Result<()> {
+        let sequence_id = frame[1];
+
+        match Response::from_frame(frame) {
+            Ok((sequence_id, response)) => {
+                self.broadcast_device_state(&response).await?;
+                if response.solicited() {
+                    self.route_response(sequence_id, Ok(response)).await?;
+                }
+            }
+            Err(error) => {
+                self.route_response(sequence_id, Err(error)).await?;
+            }
         }
 
         Ok(())
@@ -173,12 +194,16 @@ where
         Ok(())
     }
 
-    async fn route_response(&mut self, sequence_id: SequenceId, response: Response) -> Result<()> {
+    async fn route_response(
+        &mut self,
+        sequence_id: SequenceId,
+        result: Result<Response>,
+    ) -> Result<()> {
         let mut awaiting = self.shared.awaiting.lock().unwrap();
 
         match awaiting.remove(&sequence_id) {
-            Some(sender) => sender.send(response).map_err(|_| ErrorKind::ChannelError)?,
-            _ => error!("rx: unexpected response {}", response.command_id()),
+            Some(sender) => sender.send(result).map_err(|_| ErrorKind::ChannelError)?,
+            _ => error!("rx: unexpected response {:?}", result),
         }
 
         Ok(())
@@ -204,26 +229,31 @@ where
     W: AsyncWrite + Unpin,
 {
     async fn task(mut self) -> Result<()> {
-        while let Some(command) = self.commands.recv().await {
-            // TODO: Propagate errors back through the oneshot.
-            if let Err(error) = self.process_command(command).await {
-                error!("tx: {}", error);
+        while let Some(SerialCommand { request, sender }) = self.commands.recv().await {
+            let sequence_id = self.sequence_id();
+            let frame = match request.into_frame(sequence_id) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.forward_error(sender, error);
+                    continue;
+                }
+            };
+
+            self.register_awaiting(sequence_id, sender);
+            if let Err(error) = self.write_frame(frame).await {
+                if let Some(sender) = self.deregister_awaiting(sequence_id) {
+                    self.forward_error(sender, error);
+                }
             }
         }
 
         Ok(())
     }
 
-    async fn process_command(&mut self, command: SerialCommand) -> Result<()> {
-        let SerialCommand { request, sender } = command;
-
-        let sequence_id = self.sequence_id();
-        let frame = request.into_frame(sequence_id)?;
-
-        self.register_awaiting(sequence_id, sender);
-        self.write_frame(frame).await?;
-
-        Ok(())
+    fn forward_error(&self, sender: oneshot::Sender<Result<Response>>, error: Error) {
+        if let Err(error) = sender.send(Err(error)) {
+            error!("error forwarding error: {:?}", error);
+        }
     }
 
     fn sequence_id(&mut self) -> SequenceId {
@@ -234,12 +264,23 @@ where
         old
     }
 
-    fn register_awaiting(&self, sequence_id: SequenceId, sender: oneshot::Sender<Response>) {
+    fn register_awaiting(
+        &self,
+        sequence_id: SequenceId,
+        sender: oneshot::Sender<Result<Response>>,
+    ) {
         self.shared
             .awaiting
             .lock()
             .unwrap()
             .insert(sequence_id, sender);
+    }
+
+    fn deregister_awaiting(
+        &self,
+        sequence_id: SequenceId,
+    ) -> Option<oneshot::Sender<Result<Response>>> {
+        self.shared.awaiting.lock().unwrap().remove(&sequence_id)
     }
 
     async fn write_frame(&mut self, frame: Vec<u8>) -> Result<()> {
