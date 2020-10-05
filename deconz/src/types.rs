@@ -1,7 +1,7 @@
 use std::fmt::{self, Debug};
 use std::io::{Read, Write};
 
-use crate::{ReadWire, ReadWireExt, Result, WriteWire};
+use crate::{Error, ReadWire, ReadWireExt, Result, WriteWire};
 
 pub type SequenceId = u8;
 
@@ -23,6 +23,8 @@ pub struct ExtendedAddress(pub u64);
 macro_rules! wrapped_primitive {
     ($ident:ident, $repr:expr) => {
         impl ReadWire for $ident {
+            type Error = Error;
+
             fn read_wire<R>(r: &mut R) -> Result<Self>
             where
                 R: Read,
@@ -32,6 +34,8 @@ macro_rules! wrapped_primitive {
         }
 
         impl WriteWire for $ident {
+            type Error = Error;
+
             fn wire_len(&self) -> u16 {
                 self.0.wire_len()
             }

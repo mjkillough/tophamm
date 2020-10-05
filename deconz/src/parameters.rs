@@ -26,6 +26,8 @@ macro_rules! define_parameters {
         }
 
         impl WriteWire for Parameter {
+            type Error = Error;
+
             fn wire_len(&self) -> u16 {
                 match self {
                     $(Parameter::$param(_) => std::mem::size_of::<$ty>() as u16),+
@@ -71,6 +73,8 @@ macro_rules! define_parameters {
         }
 
         impl ReadWire for ParameterId {
+            type Error = Error;
+
             fn read_wire<R>(r: &mut R) -> Result<Self>
                 where
                     R: Read,
@@ -84,6 +88,8 @@ macro_rules! define_parameters {
         }
 
         impl WriteWire for ParameterId {
+            type Error = Error;
+
             fn wire_len(&self) -> u16 {
                 1
             }

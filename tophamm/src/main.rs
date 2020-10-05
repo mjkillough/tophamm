@@ -2,28 +2,80 @@
 extern crate log;
 
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::fmt::{self, Display};
+use std::io::{self, Cursor, Read, Write};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use deconz::*;
 use tokio::stream::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 type TransactionId = u8;
 
-trait Request {
-    const CLUSTER_ID: ClusterId;
-    type Response: Response;
-
-    fn into_frame(self, frame: &mut Vec<u8>) -> Result<()>;
+#[derive(Debug)]
+enum ErrorKind {
+    Deconz(deconz::Error),
+    Io(io::Error),
+    ChannelError,
 }
 
-trait Response: Sized {
+impl Display for ErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ErrorKind::Deconz(error) => write!(f, "deconz: {}", error),
+            ErrorKind::Io(error) => write!(f, "io: {}", error),
+            ErrorKind::ChannelError => write!(f, "channel error"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Error {
+    kind: ErrorKind,
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.kind)
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<deconz::Error> for Error {
+    fn from(other: deconz::Error) -> Self {
+        Error {
+            kind: ErrorKind::Deconz(other),
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(other: io::Error) -> Self {
+        Error {
+            kind: ErrorKind::Io(other),
+        }
+    }
+}
+
+impl From<oneshot::error::RecvError> for Error {
+    fn from(_: oneshot::error::RecvError) -> Error {
+        Error {
+            kind: ErrorKind::ChannelError,
+        }
+    }
+}
+
+type Result<T> = std::result::Result<T, Error>;
+
+trait Request: WriteWire {
     const CLUSTER_ID: ClusterId;
 
-    fn from_frame(frame: Cursor<&[u8]>) -> Result<Self>;
+    type Response: Response;
+}
+
+trait Response: ReadWire {
+    const CLUSTER_ID: ClusterId;
 }
 
 struct Zdo {
@@ -60,17 +112,20 @@ impl Zdo {
     fn make_frame<R>(&self, request: R) -> Result<Vec<u8>>
     where
         R: Request,
+        Error: From<R::Error>,
     {
         let mut frame = Vec::new();
         // We write a dummy transaction ID here. The Tx task will fill it in.
-        frame.write_u8(0)?;
-        request.into_frame(&mut frame)?;
+        frame.write_wire(0 as u8)?;
+        frame.write_wire(request)?;
         Ok(frame)
     }
 
     async fn make_request<R>(&self, destination: Destination, request: R) -> Result<R::Response>
     where
         R: Request,
+        Error: From<R::Error>,
+        Error: From<<R::Response as ReadWire>::Error>,
     {
         let asdu = self.make_frame(request)?;
         let request = ApsDataRequest {
@@ -89,8 +144,8 @@ impl Zdo {
 
         // Skip tx_id
         // TODO: assert cluster ID?
-        let cursor = Cursor::new(&aps_data_indication.asdu[1..]);
-        let response = R::Response::from_frame(cursor)?;
+        let mut cursor = Cursor::new(&aps_data_indication.asdu[1..]);
+        let response = cursor.read_wire()?;
 
         Ok(response)
     }
@@ -169,11 +224,23 @@ struct SimpleDescRequest {
 
 impl Request for SimpleDescRequest {
     const CLUSTER_ID: ClusterId = ClusterId(0x0004);
-    type Response = SimpleDescResponse;
 
-    fn into_frame(self, frame: &mut Vec<u8>) -> Result<()> {
-        frame.write_wire(self.addr)?;
-        frame.write_wire(self.endpoint)?;
+    type Response = SimpleDescResponse;
+}
+
+impl WriteWire for SimpleDescRequest {
+    type Error = Error;
+
+    fn wire_len(&self) -> u16 {
+        3
+    }
+
+    fn write_wire<W>(self, w: &mut W) -> Result<()>
+    where
+        W: Write,
+    {
+        w.write_wire(self.addr)?;
+        w.write_wire(self.endpoint)?;
         Ok(())
     }
 }
@@ -187,27 +254,34 @@ struct SimpleDescResponse {
 
 impl Response for SimpleDescResponse {
     const CLUSTER_ID: ClusterId = ClusterId(0x8004);
+}
 
-    fn from_frame(mut frame: Cursor<&[u8]>) -> Result<Self> {
-        let status = frame.read_u8()?;
-        let addr = frame.read_wire()?;
-        let _len = frame.read_u8()?;
+impl ReadWire for SimpleDescResponse {
+    type Error = Error;
 
-        let endpoint = frame.read_wire()?;
-        let profile = frame.read_wire()?;
-        let device_identifier = frame.read_u16::<LittleEndian>()?;
-        let device_version = frame.read_u8()?;
+    fn read_wire<R>(r: &mut R) -> Result<Self>
+    where
+        R: Read,
+    {
+        let status = r.read_wire()?;
+        let addr = r.read_wire()?;
+        let _len: u8 = r.read_wire()?;
 
-        let input_count = frame.read_u8()?;
+        let endpoint = r.read_wire()?;
+        let profile = r.read_wire()?;
+        let device_identifier = r.read_wire()?;
+        let device_version = r.read_wire()?;
+
+        let input_count: u8 = r.read_wire()?;
         let mut input_clusters = Vec::with_capacity(usize::from(input_count));
         for _ in 0..input_count {
-            input_clusters.push(frame.read_wire()?);
+            input_clusters.push(r.read_wire()?);
         }
 
-        let output_count = frame.read_u8()?;
+        let output_count: u8 = r.read_wire()?;
         let mut output_clusters = Vec::with_capacity(usize::from(output_count));
         for _ in 0..output_count {
-            output_clusters.push(frame.read_wire()?);
+            output_clusters.push(r.read_wire()?);
         }
 
         let simple_descriptor = SimpleDescriptor {
@@ -245,10 +319,22 @@ struct ActiveEpRequest {
 
 impl Request for ActiveEpRequest {
     const CLUSTER_ID: ClusterId = ClusterId(0x0005);
-    type Response = ActiveEpResponse;
 
-    fn into_frame(self, frame: &mut Vec<u8>) -> Result<()> {
-        frame.write_wire(self.addr)?;
+    type Response = ActiveEpResponse;
+}
+
+impl WriteWire for ActiveEpRequest {
+    type Error = Error;
+
+    fn wire_len(&self) -> u16 {
+        2
+    }
+
+    fn write_wire<W>(self, w: &mut W) -> Result<()>
+    where
+        W: Write,
+    {
+        w.write_wire(self.addr)?;
         Ok(())
     }
 }
@@ -262,15 +348,22 @@ struct ActiveEpResponse {
 
 impl Response for ActiveEpResponse {
     const CLUSTER_ID: ClusterId = ClusterId(0x8005);
+}
 
-    fn from_frame(mut frame: Cursor<&[u8]>) -> Result<Self> {
-        let status = frame.read_u8()?;
-        let addr = frame.read_wire()?;
+impl ReadWire for ActiveEpResponse {
+    type Error = Error;
 
-        let count = frame.read_u8()?;
+    fn read_wire<R>(r: &mut R) -> Result<Self>
+    where
+        R: Read,
+    {
+        let status = r.read_wire()?;
+        let addr = r.read_wire()?;
+
+        let count: u8 = r.read_wire()?;
         let mut active_endpoints = Vec::with_capacity(usize::from(count));
         for _ in 0..count {
-            active_endpoints.push(frame.read_wire()?);
+            active_endpoints.push(r.read_wire()?);
         }
 
         Ok(ActiveEpResponse {
@@ -288,10 +381,22 @@ struct MgmtLqiRequest {
 
 impl Request for MgmtLqiRequest {
     const CLUSTER_ID: ClusterId = ClusterId(0x0031);
-    type Response = MgmtLqiResponse;
 
-    fn into_frame(self, frame: &mut Vec<u8>) -> Result<()> {
-        frame.write_u8(self.start_index)?;
+    type Response = MgmtLqiResponse;
+}
+
+impl WriteWire for MgmtLqiRequest {
+    type Error = Error;
+
+    fn wire_len(&self) -> u16 {
+        1
+    }
+
+    fn write_wire<W>(self, w: &mut W) -> Result<()>
+    where
+        W: Write,
+    {
+        w.write_wire(self.start_index)?;
         Ok(())
     }
 }
@@ -306,20 +411,27 @@ struct MgmtLqiResponse {
 
 impl Response for MgmtLqiResponse {
     const CLUSTER_ID: ClusterId = ClusterId(0x8031);
+}
 
-    fn from_frame(mut frame: Cursor<&[u8]>) -> Result<Self> {
-        let status = frame.read_u8()?;
-        let neighbor_table_entries = frame.read_u8()?;
-        let start_index = frame.read_u8()?;
+impl ReadWire for MgmtLqiResponse {
+    type Error = Error;
 
-        let count = frame.read_u8()?;
+    fn read_wire<R>(r: &mut R) -> Result<Self>
+    where
+        R: Read,
+    {
+        let status = r.read_wire()?;
+        let neighbor_table_entries = r.read_wire()?;
+        let start_index = r.read_wire()?;
+
+        let count: u8 = r.read_wire()?;
         let mut neighbor_table_list = Vec::with_capacity(usize::from(count));
         for _ in 0..count {
-            let extended_pan_id = frame.read_u64::<LittleEndian>()?;
-            let extended_address = frame.read_wire()?;
-            let network_address = frame.read_wire()?;
+            let extended_pan_id = r.read_wire()?;
+            let extended_address = r.read_wire()?;
+            let network_address = r.read_wire()?;
 
-            let byte = frame.read_u8()?;
+            let byte: u8 = r.read_wire()?;
             let device_type = match byte & 0b11 {
                 0x0 => DeviceType::Coordinator,
                 0x1 => DeviceType::Router,
@@ -343,7 +455,8 @@ impl Response for MgmtLqiResponse {
                 _ => unreachable!("bitfield"),
             };
 
-            let permit_joining = match frame.read_u8()? & 0b11 {
+            let byte: u8 = r.read_wire()?;
+            let permit_joining = match byte & 0b11 {
                 0x0 => PermitJoining::Accepting,
                 0x1 => PermitJoining::NotAccepting,
                 0x2 => PermitJoining::Unknown,
@@ -351,10 +464,10 @@ impl Response for MgmtLqiResponse {
                 _ => unreachable!("bitfield"),
             };
 
-            let depth = frame.read_u8()?;
-            let link_quality_index = frame.read_u8()?;
+            let depth = r.read_wire()?;
+            let link_quality_index = r.read_wire()?;
 
-            let neighbor = Neighbor {
+            neighbor_table_list.push(Neighbor {
                 extended_pan_id,
                 extended_address,
                 network_address,
@@ -364,8 +477,7 @@ impl Response for MgmtLqiResponse {
                 permit_joining,
                 depth,
                 link_quality_index,
-            };
-            neighbor_table_list.push(neighbor);
+            });
         }
 
         Ok(MgmtLqiResponse {

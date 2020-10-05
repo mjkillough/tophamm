@@ -9,7 +9,9 @@ mod types;
 #[macro_use]
 extern crate log;
 
+use std::error::Error as StdError;
 use std::path::Path;
+use std::result::Result as StdResult;
 
 use tokio_serial::{Serial, SerialPortSettings};
 
@@ -48,20 +50,26 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write};
 
 pub trait ReadWire: Sized {
-    fn read_wire<R>(r: &mut R) -> Result<Self>
+    type Error: StdError;
+
+    fn read_wire<R>(r: &mut R) -> StdResult<Self, Self::Error>
     where
         R: Read;
 }
 
 pub trait WriteWire {
+    type Error: StdError;
+
     fn wire_len(&self) -> u16;
 
-    fn write_wire<W>(self, w: &mut W) -> Result<()>
+    fn write_wire<W>(self, w: &mut W) -> StdResult<(), Self::Error>
     where
         W: Write;
 }
 
 impl ReadWire for u8 {
+    type Error = Error;
+
     fn read_wire<R>(r: &mut R) -> Result<Self>
     where
         R: Read,
@@ -71,6 +79,8 @@ impl ReadWire for u8 {
 }
 
 impl WriteWire for u8 {
+    type Error = Error;
+
     fn wire_len(&self) -> u16 {
         1
     }
@@ -85,6 +95,8 @@ impl WriteWire for u8 {
 }
 
 impl ReadWire for u16 {
+    type Error = Error;
+
     fn read_wire<R>(r: &mut R) -> Result<Self>
     where
         R: Read,
@@ -94,6 +106,8 @@ impl ReadWire for u16 {
 }
 
 impl WriteWire for u16 {
+    type Error = Error;
+
     fn wire_len(&self) -> u16 {
         2
     }
@@ -108,6 +122,8 @@ impl WriteWire for u16 {
 }
 
 impl ReadWire for u32 {
+    type Error = Error;
+
     fn read_wire<R>(r: &mut R) -> Result<Self>
     where
         R: Read,
@@ -117,6 +133,8 @@ impl ReadWire for u32 {
 }
 
 impl WriteWire for u32 {
+    type Error = Error;
+
     fn wire_len(&self) -> u16 {
         2
     }
@@ -131,6 +149,8 @@ impl WriteWire for u32 {
 }
 
 impl ReadWire for u64 {
+    type Error = Error;
+
     fn read_wire<R>(r: &mut R) -> Result<Self>
     where
         R: Read,
@@ -140,6 +160,8 @@ impl ReadWire for u64 {
 }
 
 impl WriteWire for u64 {
+    type Error = Error;
+
     fn wire_len(&self) -> u16 {
         8
     }
@@ -154,7 +176,7 @@ impl WriteWire for u64 {
 }
 
 pub trait ReadWireExt {
-    fn read_wire<T>(&mut self) -> Result<T>
+    fn read_wire<T>(&mut self) -> StdResult<T, T::Error>
     where
         T: ReadWire;
 }
@@ -163,7 +185,7 @@ impl<R> ReadWireExt for R
 where
     R: Read,
 {
-    fn read_wire<T>(&mut self) -> Result<T>
+    fn read_wire<T>(&mut self) -> StdResult<T, T::Error>
     where
         T: ReadWire,
     {
@@ -172,7 +194,7 @@ where
 }
 
 pub trait WriteWireExt {
-    fn write_wire<T>(&mut self, value: T) -> Result<()>
+    fn write_wire<T>(&mut self, value: T) -> StdResult<(), T::Error>
     where
         T: WriteWire;
 }
@@ -181,7 +203,7 @@ impl<W> WriteWireExt for W
 where
     W: Write,
 {
-    fn write_wire<T>(&mut self, value: T) -> Result<()>
+    fn write_wire<T>(&mut self, value: T) -> StdResult<(), T::Error>
     where
         T: WriteWire,
     {

@@ -12,6 +12,8 @@ use crate::{Error, ErrorKind, ReadWireExt, Result, WriteWireExt};
 const HEADER_LEN: u16 = 5;
 
 impl ReadWire for Platform {
+    type Error = Error;
+
     fn read_wire<R>(r: &mut R) -> Result<Self>
     where
         R: Read,
@@ -29,6 +31,8 @@ impl ReadWire for Platform {
 }
 
 impl ReadWire for Version {
+    type Error = Error;
+
     fn read_wire<R>(r: &mut R) -> Result<Self>
     where
         R: Read,
@@ -41,6 +45,8 @@ impl ReadWire for Version {
 }
 
 impl ReadWire for DeviceState {
+    type Error = Error;
+
     fn read_wire<R>(r: &mut R) -> Result<Self>
     where
         R: Read,
@@ -70,6 +76,7 @@ impl ReadWire for DeviceState {
 }
 
 impl ReadWire for Destination {
+    type Error = Error;
     fn read_wire<R>(r: &mut R) -> Result<Self>
     where
         R: Read,
@@ -92,6 +99,8 @@ impl ReadWire for Destination {
 }
 
 impl WriteWire for Destination {
+    type Error = Error;
+
     fn wire_len(&self) -> u16 {
         match self {
             Destination::Group(_) => 2,
@@ -199,6 +208,8 @@ impl TryFrom<u8> for CommandId {
 }
 
 impl ReadWire for CommandId {
+    type Error = Error;
+
     fn read_wire<R>(r: &mut R) -> Result<Self>
     where
         R: Read,
@@ -209,6 +220,8 @@ impl ReadWire for CommandId {
 }
 
 impl WriteWire for CommandId {
+    type Error = Error;
+
     fn wire_len(&self) -> u16 {
         1
     }
