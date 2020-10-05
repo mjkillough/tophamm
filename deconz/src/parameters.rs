@@ -1,10 +1,7 @@
-use std::convert::TryFrom;
 use std::fmt::{self, Display};
-use std::io::{Cursor, Write};
+use std::io::{Read, Write};
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-
-use crate::{Error, ErrorKind, Result};
+use crate::{Error, ErrorKind, ReadWire, ReadWireExt, Result, WriteWire, WriteWireExt};
 
 macro_rules! define_parameters {
     ($(($param:ident, $id:expr, $ty:ty)),+ $(,)?) => {
@@ -26,29 +23,30 @@ macro_rules! define_parameters {
                     $(Parameter::$param(_) => ParameterId::$param),+
                 }
             }
+        }
 
-            pub fn len(&self) -> u16 {
+        impl WriteWire for Parameter {
+            fn wire_len(&self) -> u16 {
                 match self {
-                    $(Parameter::$param(_) => <$ty as ConvertParameter>::len()),+
+                    $(Parameter::$param(_) => std::mem::size_of::<$ty>() as u16),+
                 }
             }
 
-            pub fn write<W>(&self, buffer: W) -> Result<()>
-            where
-                W: Write,
-            {
+            fn write_wire<W>(self, w: &mut W) -> Result<()> where W: Write {
                 match self {
-                    $(Parameter::$param(value) => ConvertParameter::write(value, buffer)),+
-                }
+                    $(Parameter::$param(value) => w.write_wire(value)),+
+                 }
             }
         }
 
         impl ParameterId {
-            pub fn read_parameter(&self, buffer: &[u8]) -> Result<Parameter> {
+            pub fn read_parameter<R>(&self, r: &mut R) -> Result<Parameter>
+                where R: Read,
+            {
                 match self {
                     $(
                         ParameterId::$param => {
-                            let param = ConvertParameter::read(buffer)
+                            let param = r.read_wire()
                                 .map_err(|err| {
                                     Error {
                                         kind: ErrorKind::InvalidParameter {
@@ -72,10 +70,12 @@ macro_rules! define_parameters {
             }
         }
 
-        impl TryFrom<u8> for ParameterId {
-            type Error = Error;
-
-            fn try_from(byte: u8) -> Result<Self> {
+        impl ReadWire for ParameterId {
+            fn read_wire<R>(r: &mut R) -> Result<Self>
+                where
+                    R: Read,
+            {
+                let byte = u8::read_wire(r)?;
                 match byte {
                     $($id => Ok(ParameterId::$param),)+
                     _ => Err(Error { kind: ErrorKind::UnsupportedParameter(byte) }),
@@ -83,11 +83,20 @@ macro_rules! define_parameters {
             }
         }
 
-        impl From<ParameterId> for u8 {
-            fn from(id: ParameterId) -> u8 {
-                match id {
+        impl WriteWire for ParameterId {
+            fn wire_len(&self) -> u16 {
+                1
+            }
+
+            fn write_wire<W>(self, w: &mut W) -> Result<()>
+            where
+                W: Write,
+            {
+                let byte: u8 = match self {
                     $(ParameterId::$param => $id,)+
-                }
+                };
+                w.write_wire(byte)?;
+                Ok(())
             }
         }
     };
@@ -108,84 +117,4 @@ define_parameters! {
     (ProtocolVersion, 0x22, u16),
     (NwkUpdateId, 0x24, u8),
     (WatchdogTtl, 0x26, u32),
-}
-
-trait ConvertParameter: Sized {
-    fn len() -> u16;
-    fn read(buffer: &[u8]) -> Result<Self>;
-    fn write<W>(&self, buffer: W) -> Result<()>
-    where
-        W: Write;
-}
-
-impl ConvertParameter for u8 {
-    fn len() -> u16 {
-        1
-    }
-
-    fn read(buffer: &[u8]) -> Result<Self> {
-        Ok(Cursor::new(buffer).read_u8()?)
-    }
-
-    fn write<W>(&self, mut buffer: W) -> Result<()>
-    where
-        W: Write,
-    {
-        buffer.write_u8(*self)?;
-        Ok(())
-    }
-}
-
-impl ConvertParameter for u16 {
-    fn len() -> u16 {
-        2
-    }
-
-    fn read(buffer: &[u8]) -> Result<Self> {
-        Ok(Cursor::new(buffer).read_u16::<LittleEndian>()?)
-    }
-
-    fn write<W>(&self, mut buffer: W) -> Result<()>
-    where
-        W: Write,
-    {
-        buffer.write_u16::<LittleEndian>(*self)?;
-        Ok(())
-    }
-}
-
-impl ConvertParameter for u32 {
-    fn len() -> u16 {
-        4
-    }
-
-    fn read(buffer: &[u8]) -> Result<Self> {
-        Ok(Cursor::new(buffer).read_u32::<LittleEndian>()?)
-    }
-
-    fn write<W>(&self, mut buffer: W) -> Result<()>
-    where
-        W: Write,
-    {
-        buffer.write_u32::<LittleEndian>(*self)?;
-        Ok(())
-    }
-}
-
-impl ConvertParameter for u64 {
-    fn len() -> u16 {
-        8
-    }
-
-    fn read(buffer: &[u8]) -> Result<Self> {
-        Ok(Cursor::new(buffer).read_u64::<LittleEndian>()?)
-    }
-
-    fn write<W>(&self, mut buffer: W) -> Result<()>
-    where
-        W: Write,
-    {
-        buffer.write_u64::<LittleEndian>(*self)?;
-        Ok(())
-    }
 }

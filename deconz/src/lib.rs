@@ -107,6 +107,29 @@ impl WriteWire for u16 {
     }
 }
 
+impl ReadWire for u32 {
+    fn read_wire<R>(r: &mut R) -> Result<Self>
+    where
+        R: Read,
+    {
+        Ok(r.read_u32::<LittleEndian>()?)
+    }
+}
+
+impl WriteWire for u32 {
+    fn wire_len(&self) -> u16 {
+        2
+    }
+
+    fn write_wire<W>(self, w: &mut W) -> Result<()>
+    where
+        W: Write,
+    {
+        w.write_u32::<LittleEndian>(self)?;
+        Ok(())
+    }
+}
+
 impl ReadWire for u64 {
     fn read_wire<R>(r: &mut R) -> Result<Self>
     where
