@@ -1,15 +1,15 @@
 use std::convert::{TryFrom, TryInto};
 use std::fmt::{self, Display};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::{
     ApsDataConfirm, ApsDataIndication, ApsDataRequest, Destination, DestinationAddress,
-    DeviceState, NetworkState, Parameter, ParameterId, Platform, SequenceId, SourceAddress,
-    Version,
+    DeviceState, NetworkState, Parameter, ParameterId, Platform, ReadWire, SequenceId,
+    SourceAddress, Version, WriteWire,
 };
-use crate::{Error, ErrorKind, Result};
+use crate::{Error, ErrorKind, ReadWireExt, Result, WriteWireExt};
 
 const HEADER_LEN: u16 = 5;
 
@@ -73,9 +73,11 @@ impl Destination {
     fn write_address(&self, buf: &mut Vec<u8>) -> Result<()> {
         match self {
             Destination::Group(addr) | Destination::Nwk(addr, _) => {
-                buf.write_u16::<LittleEndian>(*addr)?
+                addr.write_wire(buf)?;
             }
-            Destination::Ieee(addr, _) => buf.write_u64::<LittleEndian>(*addr)?,
+            Destination::Ieee(addr, _) => {
+                addr.write_wire(buf)?;
+            }
         }
         Ok(())
     }
@@ -84,23 +86,28 @@ impl Destination {
         match self {
             Destination::Group(_) => {}
             Destination::Nwk(_, endpoint) | Destination::Ieee(_, endpoint) => {
-                buf.write_u8(*endpoint)?
+                endpoint.write_wire(buf)?;
             }
         }
         Ok(())
     }
+}
 
-    fn from_payload(payload: &mut Cursor<&[u8]>) -> Result<Self> {
-        match payload.read_u8()? {
-            0x1 => Ok(Destination::Group(payload.read_u16::<LittleEndian>()?)),
+impl ReadWire for Destination {
+    fn read_wire<R>(r: &mut R) -> Result<Self>
+    where
+        R: Read,
+    {
+        match u8::read_wire(r)? {
+            0x1 => Ok(Destination::Group(r.read_wire()?)),
             0x2 => {
-                let short_address = payload.read_u16::<LittleEndian>()?;
-                let endpoint = payload.read_u8()?;
+                let short_address = r.read_wire()?;
+                let endpoint = r.read_wire()?;
                 Ok(Destination::Nwk(short_address, endpoint))
             }
             0x3 => {
-                let extended_address = payload.read_u64::<LittleEndian>()?;
-                let endpoint = payload.read_u8()?;
+                let extended_address = r.read_wire()?;
+                let endpoint = r.read_wire()?;
                 Ok(Destination::Ieee(extended_address, endpoint))
             }
             _ => unreachable!("invalid address mode"),
@@ -259,9 +266,9 @@ impl Request {
                 buffer.write_u8(destination.address_mode())?;
                 destination.write_address(buffer)?;
                 destination.write_endpoint(buffer)?;
-                buffer.write_u16::<LittleEndian>(profile_id)?;
-                buffer.write_u16::<LittleEndian>(cluster_id)?;
-                buffer.write_u8(source_endpoint)?;
+                buffer.write_wire(profile_id)?;
+                buffer.write_wire(cluster_id)?;
+                buffer.write_wire(source_endpoint)?;
                 buffer.write_u16::<LittleEndian>(asdu.len() as u16)?;
                 buffer.extend(asdu);
                 buffer.write_u8(0x04)?; // tx options, use aps acks
@@ -413,25 +420,25 @@ impl Response {
 
                 let device_state = DeviceState::from_byte(payload.read_u8()?);
                 let destination_address = match payload.read_u8()? {
-                    0x1 => DestinationAddress::Group(payload.read_u16::<LittleEndian>()?),
-                    0x2 => DestinationAddress::Nwk(payload.read_u16::<LittleEndian>()?),
-                    0x3 => DestinationAddress::Ieee(payload.read_u64::<LittleEndian>()?),
+                    0x1 => DestinationAddress::Group(payload.read_wire()?),
+                    0x2 => DestinationAddress::Nwk(payload.read_wire()?),
+                    0x3 => DestinationAddress::Ieee(payload.read_wire()?),
                     _ => unimplemented!("unknown destination address mode"),
                 };
-                let destination_endpoint = payload.read_u8()?;
+                let destination_endpoint = payload.read_wire()?;
 
                 let source_address = match payload.read_u8()? {
                     0x4 => {
-                        let short = payload.read_u16::<LittleEndian>()?;
-                        let extended = payload.read_u64::<LittleEndian>()?;
+                        let short = payload.read_wire()?;
+                        let extended = payload.read_wire()?;
                         SourceAddress { short, extended }
                     }
                     _ => unimplemented!("unknown source address mode "),
                 };
-                let source_endpoint = payload.read_u8()?;
+                let source_endpoint = payload.read_wire()?;
 
-                let profile_id = payload.read_u16::<LittleEndian>()?;
-                let cluster_id = payload.read_u16::<LittleEndian>()?;
+                let profile_id = payload.read_wire()?;
+                let cluster_id = payload.read_wire()?;
 
                 let asdu_length = payload.read_u16::<LittleEndian>()?;
                 let mut asdu = vec![0; asdu_length.into()];
@@ -478,8 +485,8 @@ impl Response {
 
                 let device_state = DeviceState::from_byte(payload.read_u8()?);
                 let request_id = payload.read_u8()?;
-                let destination = Destination::from_payload(&mut payload)?;
-                let source_endpoint = payload.read_u8()?;
+                let destination = payload.read_wire()?;
+                let source_endpoint = payload.read_wire()?;
                 let status = payload.read_u8()?;
 
                 let aps_data_confirm = ApsDataConfirm {

@@ -75,9 +75,9 @@ impl Zdo {
         let asdu = self.make_frame(request)?;
         let request = ApsDataRequest {
             destination,
-            profile_id: 0,
+            profile_id: ProfileId(0),
             cluster_id: R::CLUSTER_ID,
-            source_endpoint: 0,
+            source_endpoint: Endpoint(0),
             asdu,
         };
 
@@ -168,12 +168,12 @@ struct SimpleDescRequest {
 }
 
 impl Request for SimpleDescRequest {
-    const CLUSTER_ID: ClusterId = 0x0004;
+    const CLUSTER_ID: ClusterId = ClusterId(0x0004);
     type Response = SimpleDescResponse;
 
     fn into_frame(self, frame: &mut Vec<u8>) -> Result<()> {
-        frame.write_u16::<LittleEndian>(self.addr)?;
-        frame.write_u8(self.endpoint)?;
+        frame.write_wire(self.addr)?;
+        frame.write_wire(self.endpoint)?;
         Ok(())
     }
 }
@@ -186,28 +186,28 @@ struct SimpleDescResponse {
 }
 
 impl Response for SimpleDescResponse {
-    const CLUSTER_ID: ClusterId = 0x8004;
+    const CLUSTER_ID: ClusterId = ClusterId(0x8004);
 
     fn from_frame(mut frame: Cursor<&[u8]>) -> Result<Self> {
         let status = frame.read_u8()?;
-        let addr = frame.read_u16::<LittleEndian>()?;
+        let addr = frame.read_wire()?;
         let _len = frame.read_u8()?;
 
-        let endpoint = frame.read_u8()?;
-        let profile = frame.read_u16::<LittleEndian>()?;
+        let endpoint = frame.read_wire()?;
+        let profile = frame.read_wire()?;
         let device_identifier = frame.read_u16::<LittleEndian>()?;
         let device_version = frame.read_u8()?;
 
         let input_count = frame.read_u8()?;
         let mut input_clusters = Vec::with_capacity(usize::from(input_count));
         for _ in 0..input_count {
-            input_clusters.push(frame.read_u16::<LittleEndian>()?);
+            input_clusters.push(frame.read_wire()?);
         }
 
         let output_count = frame.read_u8()?;
         let mut output_clusters = Vec::with_capacity(usize::from(output_count));
         for _ in 0..output_count {
-            output_clusters.push(frame.read_u16::<LittleEndian>()?);
+            output_clusters.push(frame.read_wire()?);
         }
 
         let simple_descriptor = SimpleDescriptor {
@@ -244,11 +244,11 @@ struct ActiveEpRequest {
 }
 
 impl Request for ActiveEpRequest {
-    const CLUSTER_ID: ClusterId = 0x0005;
+    const CLUSTER_ID: ClusterId = ClusterId(0x0005);
     type Response = ActiveEpResponse;
 
     fn into_frame(self, frame: &mut Vec<u8>) -> Result<()> {
-        frame.write_u16::<LittleEndian>(self.addr)?;
+        frame.write_wire(self.addr)?;
         Ok(())
     }
 }
@@ -261,16 +261,16 @@ struct ActiveEpResponse {
 }
 
 impl Response for ActiveEpResponse {
-    const CLUSTER_ID: ClusterId = 0x8005;
+    const CLUSTER_ID: ClusterId = ClusterId(0x8005);
 
     fn from_frame(mut frame: Cursor<&[u8]>) -> Result<Self> {
         let status = frame.read_u8()?;
-        let addr = frame.read_u16::<LittleEndian>()?;
+        let addr = frame.read_wire()?;
 
         let count = frame.read_u8()?;
         let mut active_endpoints = Vec::with_capacity(usize::from(count));
         for _ in 0..count {
-            active_endpoints.push(frame.read_u8()?);
+            active_endpoints.push(frame.read_wire()?);
         }
 
         Ok(ActiveEpResponse {
@@ -287,7 +287,7 @@ struct MgmtLqiRequest {
 }
 
 impl Request for MgmtLqiRequest {
-    const CLUSTER_ID: ClusterId = 0x0031;
+    const CLUSTER_ID: ClusterId = ClusterId(0x0031);
     type Response = MgmtLqiResponse;
 
     fn into_frame(self, frame: &mut Vec<u8>) -> Result<()> {
@@ -305,7 +305,7 @@ struct MgmtLqiResponse {
 }
 
 impl Response for MgmtLqiResponse {
-    const CLUSTER_ID: ClusterId = 0x8031;
+    const CLUSTER_ID: ClusterId = ClusterId(0x8031);
 
     fn from_frame(mut frame: Cursor<&[u8]>) -> Result<Self> {
         let status = frame.read_u8()?;
@@ -316,8 +316,8 @@ impl Response for MgmtLqiResponse {
         let mut neighbor_table_list = Vec::with_capacity(usize::from(count));
         for _ in 0..count {
             let extended_pan_id = frame.read_u64::<LittleEndian>()?;
-            let extended_address = frame.read_u64::<LittleEndian>()?;
-            let network_address = frame.read_u16::<LittleEndian>()?;
+            let extended_address = frame.read_wire()?;
+            let network_address = frame.read_wire()?;
 
             let byte = frame.read_u8()?;
             let device_type = match byte & 0b11 {
@@ -447,7 +447,7 @@ async fn query_endpoints(
     zdo: &Zdo,
     addr: ShortAddress,
 ) -> Result<Vec<(Endpoint, SimpleDescriptor)>> {
-    let destination = Destination::Nwk(addr, 0);
+    let destination = Destination::Nwk(addr, Endpoint(0));
     let resp = zdo
         .make_request(destination, ActiveEpRequest { addr })
         .await?;
@@ -483,7 +483,7 @@ async fn main() -> Result<()> {
         let mut zdo_tx = zdo_tx;
 
         while let Some(aps_data_indication) = aps_reader.next().await {
-            if aps_data_indication.destination_endpoint == 0 {
+            if aps_data_indication.destination_endpoint == Endpoint(0) {
                 debug!("zdo frame: {:?}", aps_data_indication);
                 zdo_tx.send(aps_data_indication).await.unwrap()
             } else {
@@ -502,10 +502,10 @@ async fn main() -> Result<()> {
 
     dbg!(fut2.await?);
 
-    for neighbor in get_neighbors(&zdo, Destination::Nwk(0x0, 0)).await? {
+    for neighbor in get_neighbors(&zdo, Destination::Nwk(ShortAddress(0x0), Endpoint(0))).await? {
         let endpoints = query_endpoints(&zdo, neighbor.network_address).await?;
         info!(
-            "neighbor = {:#04x}, endpoints = {:?}",
+            "neighbor = {:?}, endpoints = {:?}",
             neighbor.network_address, endpoints
         );
     }
