@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "deconz",
-    "tophamm"
+    "tophamm",
+    "tophamm-helpers",
 ]
 

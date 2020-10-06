@@ -1,16 +1,13 @@
 #[macro_use]
 extern crate log;
 
-use std::collections::HashMap;
 use std::fmt::{self, Display};
-use std::hash::Hash;
 use std::io::{self, Cursor, Read, Write};
-use std::result::Result as StdResult;
-use std::sync::{Arc, Mutex};
 
 use deconz::*;
 use tokio::stream::StreamExt;
 use tokio::sync::{mpsc, oneshot};
+use tophamm_helpers::{awaiting, IncrementingId};
 
 type TransactionId = u8;
 
@@ -86,20 +83,7 @@ type ZdoRequest = (
     oneshot::Sender<Result<ApsDataIndication>>,
 );
 
-use std::sync::atomic::{AtomicU8, Ordering};
-
-#[derive(Default)]
-struct IncrementingId(AtomicU8);
-
-impl IncrementingId {
-    fn new() -> Self {
-        Default::default()
-    }
-
-    fn next(&self) -> u8 {
-        self.0.fetch_add(1, Ordering::SeqCst)
-    }
-}
+type Awaiting = awaiting::Awaiting<TransactionId, ApsDataIndication, Error>;
 
 struct Zdo {
     requests: mpsc::Sender<ZdoRequest>,
@@ -176,80 +160,8 @@ impl Zdo {
     }
 }
 
-struct Awaiting<Id, Success, Error> {
-    map: Arc<Mutex<HashMap<Id, oneshot::Sender<StdResult<Success, Error>>>>>,
-}
-
-impl<Id, Success, Error> Awaiting<Id, Success, Error>
-where
-    Id: Clone + Eq + Hash,
-{
-    fn new() -> Self {
-        Self {
-            map: Default::default(),
-        }
-    }
-
-    fn register(&self, id: Id, sender: oneshot::Sender<StdResult<Success, Error>>) {
-        self.map.lock().expect("poisoned").insert(id, sender);
-    }
-
-    fn deregister(&self, id: &Id) -> Option<oneshot::Sender<StdResult<Success, Error>>> {
-        self.map.lock().expect("posoined").remove(&id)
-    }
-
-    fn send(
-        &self,
-        id: &Id,
-        result: StdResult<Success, Error>,
-    ) -> Option<StdResult<Success, Error>> {
-        match self.deregister(id) {
-            Some(sender) => {
-                let _ = sender.send(result);
-                None
-            }
-            None => Some(result),
-        }
-    }
-
-    fn send_success(&self, id: &Id, success: Success) -> Option<Success> {
-        match self.send(id, Ok(success)) {
-            Some(Ok(success)) => Some(success),
-            _ => None,
-        }
-    }
-
-    async fn register_while<F, R, E>(
-        self,
-        id: Id,
-        sender: oneshot::Sender<StdResult<Success, Error>>,
-        future: F,
-    ) where
-        F: std::future::Future<Output = StdResult<R, E>>,
-        E: Into<Error>,
-    {
-        use futures::future::FutureExt;
-
-        self.register(id.clone(), sender);
-        let future = future.map(move |result| {
-            if let Err(error) = result {
-                self.send(&id, Err(error.into()));
-            }
-        });
-        future.await;
-    }
-}
-
-impl<Id, Success, Error> Clone for Awaiting<Id, Success, Error> {
-    fn clone(&self) -> Self {
-        Self {
-            map: self.map.clone(),
-        }
-    }
-}
-
 struct Rx {
-    awaiting: Awaiting<TransactionId, ApsDataIndication, Error>,
+    awaiting: Awaiting,
     aps_data_indications: mpsc::Receiver<ApsDataIndication>,
 }
 
@@ -269,7 +181,7 @@ impl Rx {
 
 struct Tx {
     deconz: Deconz,
-    awaiting: Awaiting<TransactionId, ApsDataIndication, Error>,
+    awaiting: Awaiting,
     requests: mpsc::Receiver<ZdoRequest>,
 }
 
