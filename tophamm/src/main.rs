@@ -3,7 +3,9 @@ extern crate log;
 
 use std::collections::HashMap;
 use std::fmt::{self, Display};
+use std::hash::Hash;
 use std::io::{self, Cursor, Read, Write};
+use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex};
 
 use deconz::*;
@@ -78,45 +80,63 @@ trait Response: ReadWire {
     const CLUSTER_ID: ClusterId;
 }
 
+type ZdoRequest = (
+    TransactionId,
+    ApsDataRequest,
+    oneshot::Sender<Result<ApsDataIndication>>,
+);
+
+use std::sync::atomic::{AtomicU8, Ordering};
+
+#[derive(Default)]
+struct IncrementingId(AtomicU8);
+
+impl IncrementingId {
+    fn new() -> Self {
+        Default::default()
+    }
+
+    fn next(&self) -> u8 {
+        self.0.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
 struct Zdo {
-    commands: mpsc::Sender<(ApsDataRequest, oneshot::Sender<Result<ApsDataIndication>>)>,
+    requests: mpsc::Sender<ZdoRequest>,
+    transaction_ids: IncrementingId,
 }
 
 impl Zdo {
     fn new(deconz: Deconz, aps_data_indications: mpsc::Receiver<ApsDataIndication>) -> Self {
-        let (commands_tx, commands_rx) = mpsc::channel(1);
+        let (requests_tx, requests) = mpsc::channel(1);
 
-        let shared = Arc::new(Shared {
-            awaiting: Default::default(),
-        });
-
+        let awaiting = Awaiting::new();
         let rx = Rx {
-            shared: shared.clone(),
+            awaiting: awaiting.clone(),
             aps_data_indications,
         };
         let tx = Tx {
-            shared,
             deconz,
-            commands: commands_rx,
-            tx_id: 0,
+            awaiting,
+            requests,
         };
 
         tokio::spawn(rx.task());
         tokio::spawn(tx.task());
 
         Self {
-            commands: commands_tx,
+            requests: requests_tx,
+            transaction_ids: IncrementingId::new(),
         }
     }
 
-    fn make_frame<R>(&self, request: R) -> Result<Vec<u8>>
+    fn make_frame<R>(&self, id: TransactionId, request: R) -> Result<Vec<u8>>
     where
         R: Request,
         Error: From<R::Error>,
     {
         let mut frame = Vec::new();
-        // We write a dummy transaction ID here. The Tx task will fill it in.
-        frame.write_wire(0 as u8)?;
+        frame.write_wire(id)?;
         frame.write_wire(request)?;
         Ok(frame)
     }
@@ -127,7 +147,8 @@ impl Zdo {
         Error: From<R::Error>,
         Error: From<<R::Response as ReadWire>::Error>,
     {
-        let asdu = self.make_frame(request)?;
+        let id = self.transaction_ids.next();
+        let asdu = self.make_frame(id, request)?;
         let request = ApsDataRequest {
             destination,
             profile_id: ProfileId(0),
@@ -137,7 +158,11 @@ impl Zdo {
         };
 
         let (sender, receiver) = oneshot::channel();
-        self.commands.clone().send((request, sender)).await.unwrap();
+        self.requests
+            .clone()
+            .send((id, request, sender))
+            .await
+            .unwrap();
 
         let result = receiver.await?;
         let aps_data_indication = result?;
@@ -151,27 +176,90 @@ impl Zdo {
     }
 }
 
-struct Shared {
-    awaiting: Mutex<HashMap<TransactionId, oneshot::Sender<Result<ApsDataIndication>>>>,
+struct Awaiting<Id, Success, Error> {
+    map: Arc<Mutex<HashMap<Id, oneshot::Sender<StdResult<Success, Error>>>>>,
+}
+
+impl<Id, Success, Error> Awaiting<Id, Success, Error>
+where
+    Id: Clone + Eq + Hash,
+{
+    fn new() -> Self {
+        Self {
+            map: Default::default(),
+        }
+    }
+
+    fn register(&self, id: Id, sender: oneshot::Sender<StdResult<Success, Error>>) {
+        self.map.lock().expect("poisoned").insert(id, sender);
+    }
+
+    fn deregister(&self, id: &Id) -> Option<oneshot::Sender<StdResult<Success, Error>>> {
+        self.map.lock().expect("posoined").remove(&id)
+    }
+
+    fn send(
+        &self,
+        id: &Id,
+        result: StdResult<Success, Error>,
+    ) -> Option<StdResult<Success, Error>> {
+        match self.deregister(id) {
+            Some(sender) => {
+                let _ = sender.send(result);
+                None
+            }
+            None => Some(result),
+        }
+    }
+
+    fn send_success(&self, id: &Id, success: Success) -> Option<Success> {
+        match self.send(id, Ok(success)) {
+            Some(Ok(success)) => Some(success),
+            _ => None,
+        }
+    }
+
+    async fn register_while<F, R, E>(
+        self,
+        id: Id,
+        sender: oneshot::Sender<StdResult<Success, Error>>,
+        future: F,
+    ) where
+        F: std::future::Future<Output = StdResult<R, E>>,
+        E: Into<Error>,
+    {
+        use futures::future::FutureExt;
+
+        self.register(id.clone(), sender);
+        let future = future.map(move |result| {
+            if let Err(error) = result {
+                self.send(&id, Err(error.into()));
+            }
+        });
+        future.await;
+    }
+}
+
+impl<Id, Success, Error> Clone for Awaiting<Id, Success, Error> {
+    fn clone(&self) -> Self {
+        Self {
+            map: self.map.clone(),
+        }
+    }
 }
 
 struct Rx {
-    shared: Arc<Shared>,
+    awaiting: Awaiting<TransactionId, ApsDataIndication, Error>,
     aps_data_indications: mpsc::Receiver<ApsDataIndication>,
 }
 
 impl Rx {
     async fn task(mut self) -> Result<()> {
         while let Some(aps_data_indication) = self.aps_data_indications.next().await {
-            let tx_id = aps_data_indication.asdu[0];
+            let id = aps_data_indication.asdu[0];
 
-            match self.shared.awaiting.lock().unwrap().remove(&tx_id) {
-                Some(sender) => {
-                    sender.send(Ok(aps_data_indication)).unwrap();
-                }
-                None => {
-                    error!("zdo rx: unexpected frame: {:?}", aps_data_indication);
-                }
+            if let Some(unsolicited) = self.awaiting.send_success(&id, aps_data_indication) {
+                error!("zdo rx: unexpected frame: {:?}", unsolicited);
             }
         }
 
@@ -180,39 +268,20 @@ impl Rx {
 }
 
 struct Tx {
-    shared: Arc<Shared>,
     deconz: Deconz,
-    commands: mpsc::Receiver<(ApsDataRequest, oneshot::Sender<Result<ApsDataIndication>>)>,
-    tx_id: u8,
+    awaiting: Awaiting<TransactionId, ApsDataIndication, Error>,
+    requests: mpsc::Receiver<ZdoRequest>,
 }
 
 impl Tx {
     async fn task(mut self) -> Result<()> {
-        while let Some((mut request, sender)) = self.commands.next().await {
-            let tx_id = self.tx_id();
-            let shared = self.shared.clone();
+        while let Some((id, request, sender)) = self.requests.next().await {
             let deconz = self.deconz.clone();
-            tokio::spawn(async move {
-                shared.awaiting.lock().unwrap().insert(tx_id, sender);
-
-                request.asdu[0] = tx_id;
-
-                debug!("aps_data_request: {:?}", request);
-
-                if let Err(error) = deconz.aps_data_request(request).await {
-                    error!("zdo tx: {}", error);
-                    shared.awaiting.lock().unwrap().remove(&tx_id);
-                }
-            });
+            let future = async move { deconz.aps_data_request(request).await };
+            tokio::spawn(self.awaiting.clone().register_while(id, sender, future));
         }
 
         Ok(())
-    }
-
-    fn tx_id(&mut self) -> TransactionId {
-        let old = self.tx_id;
-        self.tx_id += 1;
-        old
     }
 }
 
