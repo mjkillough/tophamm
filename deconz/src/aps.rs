@@ -46,8 +46,11 @@ impl ApsRequests {
                     let future = self.forward_request(id, request);
                     awaiting.register_while(id, sender, future).await;
                 }
+                else => break,
             }
         }
+
+        Ok(())
     }
 
     async fn forward_request(
