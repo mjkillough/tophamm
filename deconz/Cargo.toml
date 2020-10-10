@@ -9,4 +9,5 @@ byteorder = "1.3"
 log = "0.4"
 tokio = { version = "0.2", features = ["full"] }
 tokio-serial = "4.3.3"
+tophamm-helpers = { path = "../tophamm-helpers" }
 

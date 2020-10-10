@@ -5,6 +5,7 @@ use crate::{CommandId, ParameterId, SequenceId, SlipError};
 #[derive(Debug)]
 pub enum ErrorKind {
     DuplicateSequenceId(SequenceId),
+    UnsolicitedResponse(SequenceId),
     UnexpectedResponse(CommandId),
     UnsupportedCommand(u8),
     UnsupportedParameter(u8),
@@ -24,6 +25,9 @@ impl Display for ErrorKind {
         match self {
             ErrorKind::DuplicateSequenceId(sequence_id) => {
                 write!(f, "duplicate sequence ID: {}", sequence_id)
+            }
+            ErrorKind::UnsolicitedResponse(sequence_id) => {
+                write!(f, "unsolicited response with sequence ID: {}", sequence_id,)
             }
             ErrorKind::UnexpectedResponse(command_id) => {
                 write!(f, "unexpected command ID as response: {}", command_id)

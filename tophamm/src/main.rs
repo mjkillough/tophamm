@@ -170,7 +170,7 @@ impl Rx {
         while let Some(aps_data_indication) = self.aps_data_indications.next().await {
             let id = aps_data_indication.asdu[0];
 
-            if let Some(unsolicited) = self.awaiting.send_success(&id, aps_data_indication) {
+            if let Some(Ok(unsolicited)) = self.awaiting.send(&id, Ok(aps_data_indication)) {
                 error!("zdo rx: unexpected frame: {:?}", unsolicited);
             }
         }

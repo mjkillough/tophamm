@@ -420,12 +420,12 @@ impl Response {
         }
     }
 
-    pub fn from_frame(frame: Vec<u8>) -> Result<(SequenceId, Self)> {
+    pub fn from_frame(frame: Vec<u8>) -> Result<Self> {
         let len = frame.len();
         let mut frame = Cursor::new(frame);
 
         let command_id = frame.read_wire()?;
-        let sequence_id = frame.read_wire()?;
+        let _sequence_id: u8 = frame.read_wire()?;
 
         let _reserved: u8 = frame.read_wire()?;
 
@@ -437,7 +437,7 @@ impl Response {
 
         let mut payload = frame;
 
-        let kind = match command_id {
+        let response = match command_id {
             CommandId::Version => {
                 let platform = payload.read_wire()?;
                 let version = payload.read_wire()?;
@@ -555,6 +555,6 @@ impl Response {
             }
         };
 
-        Ok((sequence_id, kind))
+        Ok(response)
     }
 }

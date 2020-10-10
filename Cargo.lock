@@ -91,6 +91,7 @@ dependencies = [
  "log",
  "tokio",
  "tokio-serial",
+ "tophamm-helpers",
 ]
 
 [[package]]
