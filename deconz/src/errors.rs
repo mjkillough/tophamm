@@ -1,11 +1,13 @@
 use std::fmt::{self, Display};
 
+use crate::protocol::RequestId;
 use crate::{CommandId, ParameterId, SequenceId, SlipError};
 
 #[derive(Debug)]
 pub enum ErrorKind {
     DuplicateSequenceId(SequenceId),
     UnsolicitedResponse(SequenceId),
+    UnsolicitedConfirm(RequestId),
     UnexpectedResponse(CommandId),
     UnsupportedCommand(u8),
     UnsupportedParameter(u8),
@@ -28,6 +30,9 @@ impl Display for ErrorKind {
             }
             ErrorKind::UnsolicitedResponse(sequence_id) => {
                 write!(f, "unsolicited response with sequence ID: {}", sequence_id,)
+            }
+            ErrorKind::UnsolicitedConfirm(request_id) => {
+                write!(f, "unsolicited confirm with request ID: {}", request_id)
             }
             ErrorKind::UnexpectedResponse(command_id) => {
                 write!(f, "unexpected command ID as response: {}", command_id)

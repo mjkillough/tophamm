@@ -1,14 +1,14 @@
-use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch};
 use tophamm_helpers::{awaiting, IncrementingId};
 
-use crate::aps::{Aps, ApsCommand, ApsReader};
+use crate::aps::{self, ApsConfirms, ApsIndications, ApsReader, ApsRequest, ApsRequests};
 use crate::slip;
 use crate::{
-    ApsDataConfirm, ApsDataRequest, DeviceState, Error, ErrorKind, Platform, Request, Response,
-    Result, SequenceId, Version,
+    ApsDataConfirm, ApsDataRequest, DeviceState, Error, ErrorKind, Platform, Request,
+    Response, Result, SequenceId, Version,
 };
+use crate::protocol::RequestId;
 
 /// A command from Deconz to the Tx task, representing a serial Request to be made and the channel
 /// tha the response should be sent on.
@@ -19,8 +19,9 @@ type Awaiting = awaiting::Awaiting<SequenceId, Response, Error>;
 #[derive(Clone)]
 pub struct Deconz {
     commands: mpsc::Sender<SerialCommand>,
-    aps_data_requests: mpsc::Sender<ApsCommand>,
+    aps_data_requests: mpsc::Sender<ApsRequest>,
     sequence_ids: IncrementingId,
+    request_ids: IncrementingId,
 }
 
 impl Deconz {
@@ -41,6 +42,7 @@ impl Deconz {
             commands: commands_tx,
             aps_data_requests: aps_data_requests_tx,
             sequence_ids: IncrementingId::new(),
+            request_ids: IncrementingId::new(),
         };
         let aps_reader = ApsReader {
             rx: aps_data_indications_rx,
@@ -58,25 +60,49 @@ impl Deconz {
             commands: commands_rx,
         };
 
-        let aps = Aps {
+        let awaiting = aps::Awaiting::new();
+        let aps_requests = ApsRequests {
             deconz: deconz.clone(),
-            request_id: 0,
-            request_free_slots: false,
+            device_state: device_state_rx.clone(),
+            awaiting: awaiting.clone(),
+            requests: aps_data_requests_rx,
+        };
+        let aps_confirms = ApsConfirms {
+            deconz: deconz.clone(),
+            device_state: device_state_rx.clone(),
+            awaiting: awaiting.clone(),
+        };
+        let aps_indications = ApsIndications {
+            deconz: deconz.clone(),
             device_state: device_state_rx,
             aps_data_indications: aps_data_indications_tx,
-            aps_data_requests: aps_data_requests_rx,
-            awaiting: HashMap::new(),
         };
+
+        // let aps = Aps {
+        //     deconz: deconz.clone(),
+        //     request_id: 0,
+        //     request_free_slots: false,
+        //     device_state: device_state_rx,
+        //     aps_data_indications: aps_data_indications_tx,
+        //     aps_data_requests: aps_data_requests_rx,
+        //     awaiting: HashMap::new(),
+        // };
 
         tokio::spawn(rx.task());
         tokio::spawn(tx.task());
-        tokio::spawn(aps.task());
+        tokio::spawn(aps_requests.task());
+        tokio::spawn(aps_confirms.task());
+        tokio::spawn(aps_indications.task());
 
         (deconz, aps_reader)
     }
 
-    pub fn sequence_id(&self) -> SequenceId {
+    fn sequence_id(&self) -> SequenceId {
         self.sequence_ids.next()
+    }
+
+    fn request_id(&self) -> RequestId {
+        self.request_ids.next()
     }
 
     pub async fn make_request(&self, request: Request) -> Result<Response> {
@@ -111,11 +137,12 @@ impl Deconz {
 
     pub async fn aps_data_request(&self, request: ApsDataRequest) -> Result<ApsDataConfirm> {
         let (sender, receiver) = oneshot::channel();
+        let request_id = self.request_id();
 
         // Send to Aps task so that it can be sent when the device is ready.
         self.aps_data_requests
             .clone()
-            .send(ApsCommand { request, sender })
+            .send((request_id, request, sender))
             .await
             .map_err(|_| ErrorKind::ChannelError)?;
 
