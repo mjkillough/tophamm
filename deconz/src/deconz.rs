@@ -1,20 +1,25 @@
+use std::time::Duration;
+
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, watch};
 use tophamm_helpers::{awaiting, IncrementingId};
 
 use crate::aps::{self, ApsConfirms, ApsIndications, ApsReader, ApsRequest, ApsRequests};
+use crate::protocol::RequestId;
 use crate::slip;
 use crate::{
-    ApsDataConfirm, ApsDataRequest, DeviceState, Error, ErrorKind, Platform, Request,
-    Response, Result, SequenceId, Version,
+    ApsDataConfirm, ApsDataRequest, DeviceState, Error, ErrorKind, Platform, Request, Response,
+    Result, SequenceId, Version,
 };
-use crate::protocol::RequestId;
 
 /// A command from Deconz to the Tx task, representing a serial Request to be made and the channel
 /// tha the response should be sent on.
 type SerialCommand = (SequenceId, Request, oneshot::Sender<Result<Response>>);
 
 type Awaiting = awaiting::Awaiting<SequenceId, Response, Error>;
+
+/// Wait for a response to serial commands for at most this amount of time.
+const TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct Deconz {
@@ -78,16 +83,6 @@ impl Deconz {
             aps_data_indications: aps_data_indications_tx,
         };
 
-        // let aps = Aps {
-        //     deconz: deconz.clone(),
-        //     request_id: 0,
-        //     request_free_slots: false,
-        //     device_state: device_state_rx,
-        //     aps_data_indications: aps_data_indications_tx,
-        //     aps_data_requests: aps_data_requests_rx,
-        //     awaiting: HashMap::new(),
-        // };
-
         tokio::spawn(rx.task());
         tokio::spawn(tx.task());
         tokio::spawn(aps_requests.task());
@@ -115,7 +110,8 @@ impl Deconz {
             .await
             .map_err(|_| ErrorKind::ChannelError)?;
 
-        let result = receiver.await.map_err(|_| ErrorKind::ChannelError)?;
+        let future = tokio::time::timeout(TIMEOUT, receiver);
+        let result = future.await?.map_err(|_| ErrorKind::ChannelError)?;
         let response = result?;
 
         Ok(response)
@@ -188,7 +184,7 @@ where
 
     async fn read_frame(&mut self) -> Result<Vec<u8>> {
         let frame = self.reader.read_frame().await?;
-        debug!("received = {:?}", frame);
+        debug!("received frame = {:?}", frame);
 
         Ok(frame)
     }
@@ -198,6 +194,8 @@ where
 
         let result = Response::from_frame(frame);
         if let Ok(response) = &result {
+            debug!("received response = {:?}", response);
+
             if let Some(device_state) = response.device_state() {
                 let _ = self.device_state.broadcast(device_state);
             }
@@ -244,8 +242,9 @@ where
     }
 
     async fn send_request(&mut self, sequence_id: SequenceId, request: Request) -> Result<()> {
+        debug!("sending request = {:?}", request);
         let frame = request.into_frame(sequence_id)?;
-        debug!("sending = {:?}", frame);
+        debug!("sending frame = {:?}", frame);
         self.writer.write_frame(&frame).await?;
         Ok(())
     }

@@ -18,6 +18,7 @@ pub enum ErrorKind {
     Slip(SlipError),
     SerialPort(tokio_serial::Error),
     Io(std::io::Error),
+    Timeout,
     ChannelError,
     Todo,
 }
@@ -50,6 +51,7 @@ impl Display for ErrorKind {
             ErrorKind::Slip(error) => write!(f, "SLIP error: {}", error),
             ErrorKind::SerialPort(error) => write!(f, "serial port error: {}", error),
             ErrorKind::Io(error) => write!(f, "IO error: {}", error),
+            ErrorKind::Timeout => write!(f, "timeout"),
             ErrorKind::ChannelError => write!(f, "channel error"),
             ErrorKind::Todo => write!(f, "TODO, oh no"),
         }
@@ -96,6 +98,14 @@ impl From<SlipError> for Error {
 impl From<ErrorKind> for Error {
     fn from(kind: ErrorKind) -> Self {
         Self { kind }
+    }
+}
+
+impl From<tokio::time::Elapsed> for Error {
+    fn from(_: tokio::time::Elapsed) -> Self {
+        Self {
+            kind: ErrorKind::Timeout,
+        }
     }
 }
 
